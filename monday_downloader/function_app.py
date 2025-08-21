@@ -3,6 +3,7 @@ import logging
 import json
 import requests
 import os
+import time
 from urllib.parse import urlparse
 from pathlib import Path
 from azure.storage.filedatalake import DataLakeServiceClient
@@ -63,13 +64,28 @@ def get_board_data(req: func.HttpRequest) -> func.HttpResponse:
         api_error = None
         
         try:
-            # Make API request to Monday.com
+            # Make API request to Monday.com with timeout and retry logic
             api_url = f"{base_url}/{api_version}"
             logging.info(f"Making request to: {api_url}")
             logging.info(f"Query being sent: {query}")
             
-            response = requests.post(api_url, json=query, headers=headers)
-            response.raise_for_status()
+            # Retry logic for timeout errors
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = requests.post(api_url, json=query, headers=headers, timeout=60)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.Timeout:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        raise
+                    logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+                except requests.exceptions.RequestException:
+                    raise
             
             json_data = response.json()
             
@@ -251,8 +267,23 @@ def get_file_data(req: func.HttpRequest) -> func.HttpResponse:
             api_url = f"{base_url}/{api_version}"
             logging.info(f"Fetching board data from: {api_url}")
             
-            response = requests.post(api_url, json=query, headers=headers)
-            response.raise_for_status()
+            # Retry logic for timeout errors
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    response = requests.post(api_url, json=query, headers=headers, timeout=60)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.Timeout:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        raise
+                    logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
+                    time.sleep(2 ** retry_count)  # Exponential backoff
+                except requests.exceptions.RequestException:
+                    raise
             
             json_data = response.json()
             logging.info(f"Successfully fetched board data for board: {board_id}")
@@ -342,12 +373,37 @@ def get_file_data(req: func.HttpRequest) -> func.HttpResponse:
                     else:
                         logging.info(f"No assets found in item {item_id}")
         
+        # Create file list JSON for downloaded files
+        if csv_files_downloaded:
+            file_list = [
+                {
+                    'rowID': file_info['item_id'],
+                    'assetID': file_info['asset_id'],
+                    'filename': file_info['filename']
+                }
+                for file_info in csv_files_downloaded
+            ]
+            
+            # Save file list to json/boards/boardID-files.json
+            files_json_path = f"{storage_path}json/boards"
+            files_json_filename = f"{board_id}-files.json"
+            
+            try:
+                files_save_result = save_to_datalake(file_list, datalake_key, files_json_path, files_json_filename)
+                if files_save_result:
+                    logging.info(f"File list saved to Data Lake: {files_json_path}/{files_json_filename}")
+                else:
+                    logging.error(f"Failed to save file list to Data Lake: {files_json_filename}")
+            except Exception as e:
+                logging.error(f"Error saving file list: {str(e)}")
+        
         # Return success response
         result = {
             'status': 'success',
             'message': 'CSV files downloaded successfully',
             'csv_files_downloaded': len(csv_files_downloaded),
-            'board_id': board_id
+            'board_id': board_id,
+            'files_list_saved': f"{storage_path}json/boards/{board_id}-files.json" if csv_files_downloaded else None
         }
         
         return func.HttpResponse(

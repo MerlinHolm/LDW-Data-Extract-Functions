@@ -49,8 +49,9 @@ Downloads CXR CSV files from board item assets.
 {
   "status": "success",
   "message": "CSV files downloaded successfully",
-  "csv_files_downloaded": 113,
-  "board_id": "4598613914"
+  "csv_files_downloaded": 3,
+  "board_id": "4598613914",
+  "files_list_saved": "MondayBoards/input/files/json/boards/4598613914-files.json"
 }
 ```
 
@@ -64,11 +65,12 @@ Downloads CXR CSV files from board item assets.
 
 ### get_file_data Flow  
 1. **Validate Parameters** → `boardID`, `api_token`, `datalake_key`
-2. **GraphQL Query** → Fetch items with assets
+2. **GraphQL Query** → Fetch items with assets (with retry logic)
 3. **Filter Assets** → Name starts with "CXR" AND extension is ".csv"
 4. **Download Files** → From Monday.com public URLs
 5. **Save to Data Lake** → `MondayBoards/input/files/csv/{boardID}/{itemID}-{assetID}.csv`
-6. **Return Response** → Success with download count
+6. **Create File List** → `MondayBoards/input/files/json/boards/{boardID}-files.json`
+7. **Return Response** → Success with download count and file list path
 
 ## Technical Details
 
@@ -134,6 +136,28 @@ if (asset_name and len(asset_name) >= 3 and
     # Download and save file
 ```
 
+### File List Output
+Creates `{boardID}-files.json` containing downloaded file information:
+```json
+[
+  {
+    "rowID": "12345",
+    "assetID": "67890", 
+    "filename": "12345-67890.csv"
+  },
+  {
+    "rowID": "12346",
+    "assetID": "67891",
+    "filename": "12346-67891.csv"
+  }
+]
+```
+
+### API Reliability Features
+- **Timeout Protection**: 60-second timeout per request
+- **Retry Logic**: Up to 3 attempts with exponential backoff (2s, 4s, 8s delays)
+- **Error Handling**: Graceful handling of Monday.com API timeouts and gateway errors
+
 ### Data Lake Storage
 - **Account**: `prodbimanager`
 - **Filesystem**: `prodbidlstorage`
@@ -141,7 +165,8 @@ if (asset_name and len(asset_name) >= 3 and
 - **CSV Path**: `MondayBoards/input/files/csv/{boardID}/`
 
 ### File Naming
-- **JSON Files**: `{boardID}.json`
+- **Board JSON**: `{boardID}.json`
+- **File List JSON**: `{boardID}-files.json`
 - **CSV Files**: `{itemID}-{assetID}.csv`
 
 ### Hardcoded Values
@@ -186,6 +211,12 @@ curl -X POST "https://monday-downloader.azurewebsites.net/api/get_file_data?code
 - **get_file_data**: `YOUR_GET_FILE_DATA_FUNCTION_KEY`
 
 ## Error Handling
+
+### Timeout and Retry Logic
+- **504 Gateway Timeout**: Automatically retries up to 3 times
+- **Connection Timeout**: 60-second timeout with exponential backoff
+- **Retry Delays**: 2 seconds, 4 seconds, 8 seconds between attempts
+- **Logging**: Detailed timeout and retry information in function logs
 
 ### Common Errors
 - **Missing api_token**: "The supplied code is not right"
