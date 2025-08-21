@@ -1,0 +1,3 @@
+azure-functions>=1.18.0
+requests>=2.31.0
+azure-storage-file-datalake>=12.14.0

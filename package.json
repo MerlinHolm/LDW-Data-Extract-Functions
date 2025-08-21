@@ -1,0 +1,24 @@
+{
+  "name": "ecomm-downloader-master",
+  "version": "1.0.0",
+  "description": "Master project for all ecommerce platform downloaders",
+  "main": "index.js",
+  "scripts": {
+    "deploy:bigcommerce": "cd bigcommerce_downloader && func azure functionapp publish <your-app-name>",
+    "deploy:magento": "cd magento_downloader && func azure functionapp publish <your-app-name>",
+    "deploy:salesforce": "cd salesforce_downloader && func azure functionapp publish <your-app-name>",
+    "deploy:shopify": "cd shopify_downloader && func azure functionapp publish <your-app-name>",
+    "deploy:all": "npm run deploy:bigcommerce && npm run deploy:magento && npm run deploy:salesforce && npm run deploy:shopify",
+    "start:bigcommerce": "cd bigcommerce_downloader && func start",
+    "start:magento": "cd magento_downloader && func start",
+    "start:salesforce": "cd salesforce_downloader && func start", 
+    "start:shopify": "cd shopify_downloader && func start"
+  },
+  "keywords": ["ecommerce", "downloader", "azure-functions", "bigcommerce", "magento", "salesforce", "shopify"],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "your-repo-url"
+  }
+}

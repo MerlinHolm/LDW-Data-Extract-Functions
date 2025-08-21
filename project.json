@@ -1,0 +1,37 @@
+{
+  "name": "EcommDownloader Master Project",
+  "description": "Master project containing all ecommerce platform downloaders",
+  "type": "master",
+  "version": "1.0.0",
+  "subprojects": [
+    {
+      "name": "BigCommerce Downloader",
+      "path": "./bigcommerce_downloader",
+      "platform": "bigcommerce",
+      "type": "azure-function"
+    },
+    {
+      "name": "Magento Downloader", 
+      "path": "./magento_downloader",
+      "platform": "magento",
+      "type": "azure-function"
+    },
+    {
+      "name": "Salesforce Downloader",
+      "path": "./salesforce_downloader", 
+      "platform": "salesforce",
+      "type": "azure-function"
+    },
+    {
+      "name": "Shopify Downloader",
+      "path": "./shopify_downloader",
+      "platform": "shopify", 
+      "type": "azure-function"
+    }
+  ],
+  "scripts": {
+    "deploy-all": "Deploy all ecommerce downloaders",
+    "test-all": "Run tests for all downloaders",
+    "build-all": "Build all downloader functions"
+  }
+}
