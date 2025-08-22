@@ -9,7 +9,139 @@ import base64
 
 app = func.FunctionApp()
 
-@app.route(route="get-order-data", auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="get_product_data", auth_level=func.AuthLevel.FUNCTION)
+def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Processing Salesforce Commerce Cloud product data request')
+    
+    try:
+        # Get required parameters
+        client_id = req.params.get('client_id')
+        client_secret = req.params.get('client_secret')
+        datalake_key = req.params.get('datalake_key')
+        
+        if not client_id:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameter: client_id"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        if not client_secret:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameter: client_secret"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+            
+        if not datalake_key:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameter: datalake_key"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Get other parameters with defaults
+        base_url = req.params.get('base_url', 'kv7kzm78.api.commercecloud.salesforce.com')
+        
+        # Add https:// prefix if not present
+        if not base_url.startswith('http://') and not base_url.startswith('https://'):
+            base_url = f'https://{base_url}'
+        api_version = req.params.get('api_version', 'v1')
+        organization_id = req.params.get('organization_id', 'f_ecom_zysr_001')
+        site_id = req.params.get('site_id', 'RefArchGlobal')
+        data_lake_path = req.params.get('data_lake_path')
+        filename = req.params.get('filename')
+        page_size = req.params.get('page_size', '200')
+        catalog_id = req.params.get('catalog_id')
+        price_book_id = req.params.get('price_book_id')
+
+        if not data_lake_path:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameter: data_lake_path"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        if not filename:
+            return func.HttpResponse(
+                json.dumps({"error": "Missing required parameter: filename"}),
+                status_code=400,
+                mimetype="application/json"
+            )
+        
+        # Get OAuth token
+        access_token = get_salesforce_access_token(client_id, client_secret)
+        if not access_token:
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to obtain access token", "debug": "Check OAuth2 credentials and endpoint"}),
+                status_code=401,
+                mimetype="application/json"
+            )
+        
+        # Fetch combined product data (products + inventory + pricing)
+        product_data = fetch_salesforce_products(access_token, base_url, organization_id, site_id, page_size, catalog_id, price_book_id)
+        
+        # Check for errors
+        items_list = product_data.get('data', [])
+        has_items = len(items_list) > 0
+        has_errors = 'error' in product_data
+
+        if has_errors:
+            return func.HttpResponse(
+                json.dumps(product_data),
+                status_code=500,
+                mimetype="application/json"
+            )
+
+        # Construct the final filename by appending '-products'
+        final_filename = f"{filename}-products"
+
+        save_result = save_to_datalake(product_data, datalake_key, data_lake_path, final_filename)
+
+        if save_result:
+            # The save_to_datalake function adds .json, so reflect that in the response
+            response_filename = f"{final_filename}.json"
+            response_data = {
+                "status": "success",
+                "message": "Successfully downloaded and saved combined product data",
+                "records_count": len(items_list),
+                "filename": response_filename,
+                "path": data_lake_path
+            }
+        else:
+            response_data = {
+                "status": "error",
+                "message": "Data retrieved but failed to save to Data Lake",
+                "records_count": len(items_list),
+                "filename": None,
+                "path": None
+            }
+
+        return func.HttpResponse(
+            json.dumps(response_data),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Unexpected error in get_product_data: {str(e)}")
+        import traceback
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+        
+        error_response = {
+            "error": "UNEXPECTED_ERROR",
+            "message": f"An unexpected error occurred: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+        
+        return func.HttpResponse(
+            json.dumps(error_response),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@app.route(route="get_order_data", auth_level=func.AuthLevel.FUNCTION)
 def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing Salesforce Commerce Cloud order data request')
     
@@ -239,9 +371,14 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
         # Prepare query parameters
         params = {
             'siteId': site_id,
-            'limit': limit
+            'count': limit,
+            'start': 0
         }
-        
+
+        # Add price_book_id refinement if provided
+        # if price_book_id:
+        #     params['refine'] = f'price_book_id={price_book_id}'
+
         # Add date filters if provided
         if start_date and end_date:
             params['creationDateFrom'] = start_date
@@ -375,3 +512,342 @@ def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = N
         import traceback
         logging.error(f"Full traceback: {traceback.format_exc()}")
         return False
+
+
+def fetch_salesforce_products(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str, catalog_id: str = None, price_book_id: str = None) -> dict:
+    """
+    Fetch products from Salesforce Commerce Cloud Product Search API
+    """
+    try:
+        # Build the API URL
+        api_path = f"/product/products/v1"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/product-search"
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Enhanced product search query with comprehensive fields
+        search_query = {
+            "limit": int(page_size),
+            "query": {
+                "textQuery": {
+                    "fields": [
+                        # Basic queryable fields only
+                        "id", "name"
+                    ],
+                    "searchPhrase": "*"
+                }
+            },
+            "offset": 0,
+            "expand": [
+                "availability", "images", "prices"
+            ]
+        }
+        
+        logging.info(f"Fetching products from Salesforce Commerce Cloud: {url}")
+        logging.info(f"Search query: {json.dumps(search_query, indent=2)}")
+        
+        all_products = []
+        offset = 0
+        max_pages = 50  # Safety limit
+        page_count = 0
+        
+        while page_count < max_pages:
+            page_count += 1
+            search_query["offset"] = offset
+            
+            logging.info(f"Fetching page {page_count}, offset {offset}")
+            
+            response = requests.post(url, headers=headers, json=search_query, timeout=60)
+            
+            if response.status_code != 200:
+                logging.error(f"Salesforce API error: {response.status_code}")
+                logging.error(f"Response: {response.text}")
+                return {
+                    "error": "API_ERROR",
+                    "message": f"Salesforce API returned status {response.status_code}",
+                    "details": response.text
+                }
+            
+            data = response.json()
+            products = data.get('hits', [])
+            
+            if not products:
+                logging.info("No more products found, ending pagination")
+                break
+                
+            # Process each product to organize inventory and pricing data
+            for product in products:
+                # Extract and organize inventory data
+                availability_model = product.get('availabilityModel', {})
+                inventory_record = availability_model.get('inventoryRecord', {})
+                
+                product['inventory'] = {
+                    "orderable": availability_model.get('orderable', False),
+                    "in_stock": availability_model.get('inStock', False),
+                    "allocation": inventory_record.get('allocation', 0),
+                    "preorderable": inventory_record.get('preorderable', False),
+                    "backorderable": inventory_record.get('backorderable', False),
+                    "stock_level": inventory_record.get('stockLevel', 0),
+                    "ats": inventory_record.get('ats', 0),
+                    "reservations": inventory_record.get('reservations', 0),
+                    "turnover": inventory_record.get('turnover', 0)
+                }
+                
+                # Temporarily disabled pricing and promotion processing
+                # # Extract and organize pricing data
+                # price_model = product.get('priceModel', {})
+                # price_info = price_model.get('priceInfo', {})
+                # price_range = price_model.get('priceRange', {})
+                
+                # product['pricing'] = {
+                #     "currency": product.get('currency', 'USD'),
+                #     "price": price_model.get('price', 0),
+                #     "price_book": price_info.get('priceBook'),
+                #     "price_book_price": price_model.get('priceBookPrice', 0),
+                #     "min_price": price_range.get('minPrice', 0),
+                #     "max_price": price_range.get('maxPrice', 0),
+                #     "price_tiers": price_range.get('priceTiers', []),
+                #     "tiered_prices": price_model.get('tieredPrices', [])
+                # }
+                
+                # # Extract promotions
+                # promotions = product.get('promotions', [])
+                # product_promotions = product.get('productPromotions', [])
+                
+                # product['promotions'] = {
+                #     "active_promotions": promotions,
+                #     "product_promotions": product_promotions,
+                #     "promotional_price": next((p.get('promotionalPrice') for p in promotions if p.get('promotionalPrice')), None),
+                #     "callout_message": next((p.get('calloutMsg') for p in promotions if p.get('calloutMsg')), None)
+                # }
+            
+            all_products.extend(products)
+            logging.info(f"Retrieved {len(products)} products, total: {len(all_products)}")
+            
+            # Check if we have more pages
+            total = data.get('total', 0)
+            if offset + len(products) >= total:
+                logging.info(f"Reached end of results: {offset + len(products)} >= {total}")
+                break
+                
+            offset += len(products)
+        
+        # Format response data
+        final_data = {
+            "data": all_products,
+            "total_count": len(all_products),
+            "metadata": {
+                "source": url,
+                "organization_id": organization_id,
+                "site_id": site_id,
+                "item_type": "products_combined",
+                "includes": ["products", "inventory", "pricing", "promotions"],
+                "page_size": page_size,
+                "pages_fetched": page_count,
+                "timestamp": datetime.now().isoformat(),
+                "note": "Products with organized inventory, pricing, and promotion data"
+            }
+        }
+        
+        logging.info(f"Successfully fetched {len(all_products)} products from Salesforce")
+        return final_data
+
+    except Exception as e:
+        logging.error(f"Error fetching Salesforce products: {str(e)}")
+        import traceback
+        logging.error(f"Full traceback: {traceback.format_exc()}")
+        return {
+            "error": "FETCH_ERROR",
+            "message": f"Failed to fetch products: {str(e)}",
+            "traceback": traceback.format_exc()
+        }
+
+
+def fetch_salesforce_inventory(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str) -> dict:
+    """
+    Fetch inventory data from Salesforce Commerce Cloud
+    """
+    try:
+        # Build the API URL
+        api_path = f"/product/products/v1"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/product-search"
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Inventory-focused search query
+        search_query = {
+            "limit": int(page_size),
+            "query": {
+                "textQuery": {
+                    "fields": [
+                        "id", "inventoryRecord.allocation", "inventoryRecord.preorderable", 
+                        "inventoryRecord.backorderable", "inventoryRecord.stockLevel", "inventoryRecord.ats",
+                        "inventoryRecord.reservations", "inventoryRecord.turnover", "availabilityModel.orderable",
+                        "availabilityModel.inStock", "availabilityModel.inventoryRecord"
+                    ],
+                    "searchPhrase": "*"
+                }
+            },
+            "offset": 0,
+            "expand": ["availability", "inventory"],
+            "select": "(id,inventoryRecord,availabilityModel)"
+        }
+        
+        logging.info(f"Fetching inventory from Salesforce Commerce Cloud: {url}")
+        
+        all_inventory = []
+        offset = 0
+        max_pages = 50
+        page_count = 0
+        
+        while page_count < max_pages:
+            page_count += 1
+            search_query["offset"] = offset
+            
+            response = requests.post(url, headers=headers, json=search_query, timeout=60)
+            
+            if response.status_code != 200:
+                logging.error(f"Salesforce API error: {response.status_code}")
+                return {
+                    "error": "API_ERROR",
+                    "message": f"Salesforce API returned status {response.status_code}",
+                    "details": response.text
+                }
+            
+            data = response.json()
+            inventory_items = data.get('hits', [])
+            
+            if not inventory_items:
+                break
+                
+            all_inventory.extend(inventory_items)
+            
+            total = data.get('total', 0)
+            if offset + len(inventory_items) >= total:
+                break
+                
+            offset += len(inventory_items)
+        
+        final_data = {
+            "data": all_inventory,
+            "total_count": len(all_inventory),
+            "metadata": {
+                "source": url,
+                "organization_id": organization_id,
+                "site_id": site_id,
+                "item_type": "inventory",
+                "page_size": page_size,
+                "pages_fetched": page_count,
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        
+        return final_data
+
+    except Exception as e:
+        logging.error(f"Error fetching Salesforce inventory: {str(e)}")
+        return {
+            "error": "FETCH_ERROR",
+            "message": f"Failed to fetch inventory: {str(e)}"
+        }
+
+
+def fetch_salesforce_pricing(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str, price_book_id: str = None) -> dict:
+    """
+    Fetch pricing data from Salesforce Commerce Cloud
+    """
+    try:
+        # Build the API URL
+        api_path = f"/product/products/v1"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/product-search"
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Pricing-focused search query
+        search_query = {
+            "limit": int(page_size),
+            "query": {
+                "textQuery": {
+                    "fields": [
+                        "id", "currency", "priceModel.price", "priceModel.priceInfo.price",
+                        "priceModel.priceInfo.priceBook", "priceModel.priceBook", "priceModel.priceBookPrice",
+                        "priceModel.priceRange.maxPrice", "priceModel.priceRange.minPrice", "priceModel.priceRange.priceTiers",
+                        "priceModel.tieredPrices", "promotions.promotionalPrice", "promotions.calloutMsg", "productPromotions"
+                    ],
+                    "searchPhrase": "*"
+                }
+            },
+            "offset": 0,
+            "expand": ["prices", "promotions", "price_books"],
+            "select": "(id,currency,priceModel,promotions,productPromotions)"
+        }
+        
+        logging.info(f"Fetching pricing from Salesforce Commerce Cloud: {url}")
+        
+        all_pricing = []
+        offset = 0
+        max_pages = 50
+        page_count = 0
+        
+        while page_count < max_pages:
+            page_count += 1
+            search_query["offset"] = offset
+            
+            response = requests.post(url, headers=headers, json=search_query, timeout=60)
+            
+            if response.status_code != 200:
+                logging.error(f"Salesforce API error: {response.status_code}")
+                return {
+                    "error": "API_ERROR",
+                    "message": f"Salesforce API returned status {response.status_code}",
+                    "details": response.text
+                }
+            
+            data = response.json()
+            pricing_items = data.get('hits', [])
+            
+            if not pricing_items:
+                break
+                
+            all_pricing.extend(pricing_items)
+            
+            total = data.get('total', 0)
+            if offset + len(pricing_items) >= total:
+                break
+                
+            offset += len(pricing_items)
+        
+        final_data = {
+            "data": all_pricing,
+            "total_count": len(all_pricing),
+            "metadata": {
+                "source": url,
+                "organization_id": organization_id,
+                "site_id": site_id,
+                "item_type": "pricing",
+                "page_size": page_size,
+                "pages_fetched": page_count,
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        
+        return final_data
+
+    except Exception as e:
+        logging.error(f"Error fetching Salesforce pricing: {str(e)}")
+        return {
+            "error": "FETCH_ERROR",
+            "message": f"Failed to fetch pricing: {str(e)}"
+        }

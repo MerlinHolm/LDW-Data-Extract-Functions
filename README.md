@@ -13,7 +13,7 @@ The EcommDownloader project contains Azure Function apps for downloading data fr
 | **Monday.com** | `get_board_data`, `get_file_data` | Board metadata, CXR CSV files | API Token | GraphQL |
 | **Magento** | `get_magento_data`, `get_magento_products` | Orders, Shipments, Products, Categories | Bearer Token | REST |
 | **BigCommerce** | `get_product_data` | Products, Brands, Categories, Variants | X-Auth-Token | REST v3 |
-| **Salesforce** | `get-order-data` | Orders | OAuth2 Client Credentials | REST |
+| **Salesforce** | `get_product_data`, `get_order_data` | Products, Orders | OAuth2 Client Credentials | REST |
 | **Shopify** | `get_product_data` | Products with Variants/Collections | X-Shopify-Access-Token | GraphQL |
 
 ## Common Architecture
@@ -60,7 +60,7 @@ All functions return consistent JSON responses:
 - **Monday.com**: `{itemID}-{assetID}.csv` for files, `{boardID}.json` for metadata
 - **Magento**: `{filename}.YYYYMMDD-{item}.json` (orders), `{filename}-{item}.json` (products)
 - **BigCommerce**: `{filename}-{item}.json`
-- **Salesforce**: `{filename}.YYYYMMDD-orders.json`
+- **Salesforce**: `{filename}.json` (products), `{filename}.YYYYMMDD-orders.json` (orders)
 - **Shopify**: `{filename}-products.json`
 
 ## Detailed Platform Patterns
@@ -92,13 +92,15 @@ All functions return consistent JSON responses:
 - **Parameters**: `auth_token`, `datalake_key`, `base_url` (store hash), `item`, `page_size`
 
 ### Salesforce Downloader Pattern
-- **Function**: `get-order-data` (orders only)
+- **Functions**: `get_product_data` (products), `get_order_data` (orders)
 - **Authentication**: OAuth2 client credentials flow → Bearer token
-- **API**: Commerce Cloud REST API with offset pagination
-- **Date Filtering**: `creationDateFrom`/`creationDateTo` parameters
+- **API**: Commerce Cloud REST API (Product Search and Orders)
 - **Pagination**: Offset-based with configurable limit
-- **Storage**: Date-based files `{filename}.YYYYMMDD-orders.json`
-- **Parameters**: `client_id`, `client_secret`, `datalake_key`, `base_url`, `organization_id`, `site_id`, `start_date`, `end_date`
+- **Storage**: Single file for products (`{filename}.json`), date-based for orders (`{filename}.YYYYMMDD-orders.json`)
+- **Parameters**:
+    - **Common**: `client_id`, `client_secret`, `datalake_key`, `base_url`, `organization_id`, `site_id`
+    - **Products**: `data_lake_path`, `filename`, `page_size`, `catalog_id`, `price_book_id`
+    - **Orders**: `limit`, `data_lake_path`, `filename`, `start_date`, `end_date`
 
 ### Shopify Downloader Pattern
 - **Function**: `get_product_data` (products only)
@@ -162,7 +164,7 @@ Each downloader has comprehensive documentation:
 - [Monday.com Downloader](./monday_downloader/README.md) - Board data and CXR CSV file extraction
 - [Magento Downloader](./magento_downloader/README.md) - Orders, shipments, and product data
 - [BigCommerce Downloader](./bigcommerce_downloader/README.md) - Product catalog data
-- [Salesforce Downloader](./salesforce_downloader/README.md) - Commerce Cloud order data
+- [Salesforce Downloader](./salesforce_downloader/README.md) - Product and order data
 - [Shopify Downloader](./shopify_downloader/README.md) - Product data with GraphQL
 
 ## Upcoming Extensions
@@ -170,6 +172,5 @@ Each downloader has comprehensive documentation:
 **Planned Functions:**
 - Shopify order functions
 - BigCommerce order functions  
-- Salesforce product functions
 
 All new functions will follow the established patterns for their respective platforms.
