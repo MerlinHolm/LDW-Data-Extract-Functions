@@ -2,6 +2,7 @@ import azure.functions as func
 import json
 import logging
 import requests
+import re
 from datetime import datetime
 from azure.storage.filedatalake import DataLakeServiceClient
 
@@ -377,6 +378,313 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
         }
 
 
+@app.route(route="get_order_data")
+def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Shopify order data download function processed a request.')
+
+    try:
+        # Get parameters from request
+        auth_token = req.params.get('auth_token')
+        base_url = req.params.get('base_url')
+        api_version = req.params.get('api_version', '2024-10')
+        datalake_key = req.params.get('datalake_key')
+        data_lake_path = req.params.get('data_lake_path', 'Retail/Shopify/Orders')
+        page_size = req.params.get('page_size', '100')
+        order_number_raw = req.params.get('order_number')
+        order_number = None
+        if order_number_raw:
+            # Clean the input order number to only keep digits
+            numeric_order_number = re.sub(r'\D', '', order_number_raw)
+            if numeric_order_number:
+                # Use the numeric part of the order number directly for the search
+                order_number = numeric_order_number
+            else:
+                # If the order_number param contains no digits, it's invalid.
+                return func.HttpResponse(
+                    json.dumps({"status": "error", "message": "Invalid order_number parameter: must contain digits."}),
+                    status_code=400, mimetype="application/json"
+                )
+
+        created_at_min = req.params.get('created_at_min')
+        created_at_max = req.params.get('created_at_max')
+        updated_at_min = req.params.get('updated_at_min')
+        updated_at_max = req.params.get('updated_at_max')
+
+        # Validate required parameters
+        if not all([auth_token, base_url, datalake_key]):
+            return func.HttpResponse(
+                json.dumps({"error": "MISSING_PARAMETER", "message": "auth_token, base_url, and datalake_key are required"}),
+                status_code=400, mimetype="application/json"
+            )
+
+        # Construct full Shopify GraphQL URL
+        full_base_url = f"https://{base_url}.myshopify.com/admin/api/{api_version}/graphql.json"
+        
+        logging.info(f"Fetching Shopify order data from: {full_base_url}")
+
+        # Fetch Shopify order data
+        order_data = fetch_shopify_orders(auth_token, full_base_url, page_size, order_number, created_at_min, created_at_max, updated_at_min, updated_at_max)
+
+        if 'error' in order_data:
+            return func.HttpResponse(json.dumps(order_data), status_code=500, mimetype="application/json")
+
+        orders = order_data.get('data', [])
+        if not orders:
+            return func.HttpResponse(json.dumps({"status": "success", "message": "No new orders found.", "records_count": 0}), status_code=200, mimetype="application/json")
+
+        # Save each order to Data Lake
+        saved_files = []
+        failed_files = []
+        for raw_order in orders:
+            # Transform the order to flatten nested connections like 'edges' and 'node'
+            order = _transform_order(raw_order)
+            if not order:
+                logging.warning("Skipping an order that failed transformation.")
+                continue
+
+
+            # New filename logic: clean the order name to use for the filename.
+            order_name = order.get('name')
+            if order_name:
+                # Remove any character that is not a letter, number, or dash.
+                cleaned_name = re.sub(r'[^a-zA-Z0-9-]', '', order_name)
+                # Remove any leading dashes.
+                filename = cleaned_name.lstrip('-')
+                
+                if filename:
+                    if save_order_to_datalake(order, datalake_key, data_lake_path, filename):
+                        saved_files.append(f"{filename}.json")
+                    else:
+                        failed_files.append(f"{filename}.json")
+                else:
+                    # Fallback if the cleaned name is empty.
+                    fallback_id = order.get('legacyResourceId', order.get('id', 'unknown_id'))
+                    logging.warning(f"Could not generate a valid filename from order name: '{order_name}'. Fallback ID: {fallback_id}")
+                    failed_files.append(f"FAILED_INVALID_NAME(id_{fallback_id})")
+            else:
+                # Fallback if the order has no 'name' field.
+                fallback_id = order.get('legacyResourceId', order.get('id', 'unknown_id'))
+                logging.warning(f"Order is missing 'name' field. Cannot save file. Fallback ID: {fallback_id}")
+                failed_files.append(f"FAILED_NO_NAME(id_{fallback_id})")
+
+        response_data = {
+            "status": "partial_success" if failed_files else "success",
+            "message": f"Processed {len(orders)} orders.",
+            "records_saved": len(saved_files),
+            "records_failed": len(failed_files),
+            "saved_files": saved_files,
+            "failed_files": failed_files,
+            "path": data_lake_path
+        }
+        
+        return func.HttpResponse(json.dumps(response_data), status_code=200, mimetype="application/json")
+
+    except Exception as e:
+        logging.error(f"Unexpected error in get_order_data: {str(e)}")
+        import traceback
+        return func.HttpResponse(
+            json.dumps({"error": "UNEXPECTED_ERROR", "message": str(e), "traceback": traceback.format_exc()}),
+            status_code=500, mimetype="application/json"
+        )
+
+def fetch_shopify_orders(auth_token: str, graphql_url: str, page_size: str, order_number: str = None, created_at_min: str = None, created_at_max: str = None, updated_at_min: str = None, updated_at_max: str = None) -> dict:
+    headers = {'X-Shopify-Access-Token': auth_token, 'Content-Type': 'application/json'}
+    
+    # Build the filter query string
+    if order_number:
+        # If an order number is provided, perform a 'contains' search using wildcards
+        query_filter = f"name:*{order_number}*"
+    else:
+        filters = []
+        if created_at_min:
+            filters.append(f"created_at:>= '{created_at_min}'")
+        if created_at_max:
+            filters.append(f"created_at:<= '{created_at_max}'")
+        if updated_at_min:
+            filters.append(f"updated_at:>= '{updated_at_min}'")
+        if updated_at_max:
+            filters.append(f"updated_at:<= '{updated_at_max}'")
+        query_filter = " AND ".join(filters)
+    logging.info(f"Using query filter: {query_filter}")
+
+    # The GraphQL query structure is based on the 1004.json file provided.
+    # This is a comprehensive query to get all relevant order details.
+    query_template = """query($cursor: String, $query: String) {{
+        orders(first: {page_size}, after: $cursor, query: $query, sortKey: UPDATED_AT, reverse: true) {{
+            edges {{
+                node {{
+                    id
+                    legacyResourceId
+                    name
+                    email
+                    confirmed
+                    processedAt
+                    createdAt
+                    updatedAt
+                    closedAt
+                    cancelReason
+                    cancelledAt
+                    customerLocale
+                    currencyCode
+                    phone
+                    note
+                    tags
+                    taxExempt
+                    estimatedTaxes
+                    displayFinancialStatus
+                    displayFulfillmentStatus
+                    currentSubtotalPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                    currentTotalDiscountsSet {{ shopMoney {{ amount currencyCode }} }}
+                    currentTotalPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                    currentTotalTaxSet {{ shopMoney {{ amount currencyCode }} }}
+                    subtotalPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                    totalPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                    totalShippingPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                    totalTaxSet {{ shopMoney {{ amount currencyCode }} }}
+                    taxLines {{ title priceSet {{ shopMoney {{ amount currencyCode }} }} }}
+                    shippingLines(first: 5) {{
+                        edges {{
+                            node {{
+                                title
+                                carrierIdentifier
+                                price
+                                source
+                                originalPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                                discountedPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                                taxLines {{ title priceSet {{ shopMoney {{ amount currencyCode }} }} }}
+                            }}
+                        }}
+                    }}
+                    customer {{ id email firstName lastName phone createdAt updatedAt defaultAddress {{ firstName lastName address1 address2 city province country zip phone countryCode provinceCode }} }}
+                    shippingAddress {{ firstName lastName address1 address2 city province country zip phone company countryCode provinceCode name }}
+                    billingAddress {{ firstName lastName address1 address2 city province country zip phone company countryCode provinceCode name }}
+                    lineItems(first: 250) {{
+                        edges {{
+                            node {{
+                                id
+                                title
+                                quantity
+                                sku
+                                variantTitle
+                                vendor
+                                fulfillableQuantity
+                                taxable
+                                requiresShipping
+                                variant {{ id title price inventoryPolicy product {{ id title vendor productType }} }}
+                                originalUnitPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                                discountedUnitPriceSet {{ shopMoney {{ amount currencyCode }} }}
+                                originalTotalSet {{ shopMoney {{ amount currencyCode }} }}
+                                discountedTotalSet {{ shopMoney {{ amount currencyCode }} }}
+                                totalDiscountSet {{ shopMoney {{ amount currencyCode }} }}
+                                taxLines {{ title priceSet {{ shopMoney {{ amount currencyCode }} }} }}
+                            }}
+                        }}
+                    }}
+                    fulfillments(first: 50) {{
+                        id
+                        status
+                        createdAt
+                        updatedAt
+                        legacyResourceId
+                        trackingInfo(first: 50) {{
+                            company
+                            number
+                            url
+                        }}
+                        fulfillmentLineItems(first: 50) {{
+                            edges {{
+                                node {{
+                                    lineItem {{ id title quantity sku vendor variantTitle originalUnitPriceSet {{ shopMoney {{ amount currencyCode }} }} }}
+                                    quantity
+                                }}
+                            }}
+                        }}
+                    }}
+                    refunds(first: 50) {{
+                        id
+                        createdAt
+                        note
+                        totalRefundedSet {{ shopMoney {{ amount currencyCode }} }}
+                        refundLineItems(first: 50) {{
+                            edges {{
+                                node {{
+                                    lineItem {{ id title sku }}
+                                    quantity
+                                    subtotalSet {{ shopMoney {{ amount currencyCode }} }}
+                                }}
+                            }}
+                        }}
+                    }}
+                    customAttributes {{ key value }}
+                }}
+            }}
+            pageInfo {{
+                hasNextPage
+                endCursor
+            }}
+        }}
+    }}"""
+
+    all_orders = []
+    cursor = None
+    page_count = 0
+    max_pages = 100 # Safety break
+
+    while page_count < max_pages:
+        page_count += 1
+        variables = {"cursor": cursor, "query": query_filter if query_filter else None}
+        graphql_query = {"query": query_template.format(page_size=page_size), "variables": variables}
+        
+        try:
+            response = requests.post(graphql_url, headers=headers, json=graphql_query, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'errors' in data:
+                logging.error(f"GraphQL errors: {data['errors']}")
+                return {"error": "GRAPHQL_QUERY_ERROR", "details": data['errors']}
+
+            orders_data = data.get('data', {}).get('orders', {})
+            page_info = orders_data.get('pageInfo', {})
+
+            for edge in orders_data.get('edges', []):
+                all_orders.append(edge['node'])
+
+            logging.info(f"Page {page_count}: Fetched {len(orders_data.get('edges', []))} orders. Total so far: {len(all_orders)}")
+
+            if not page_info.get('hasNextPage'):
+                break
+            cursor = page_info.get('endCursor')
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error fetching Shopify orders: {e}")
+            return {"error": "FETCH_ERROR", "message": str(e)}
+
+    return {"data": all_orders, "total_count": len(all_orders)}
+
+def save_order_to_datalake(data: dict, datalake_key: str, path: str, filename: str) -> bool:
+    try:
+        account_name = "prodbimanager"
+        account_url = f"https://{account_name}.dfs.core.windows.net"
+        service_client = DataLakeServiceClient(account_url=account_url, credential=datalake_key)
+        file_system_client = service_client.get_file_system_client("prodbidlstorage")
+        
+        # Ensure .json extension
+        if not filename.endswith('.json'):
+            filename = f"{filename}.json"
+
+        file_path = f"{path}/{filename}"
+        json_data = json.dumps(data, indent=4, default=str)
+        
+        file_client = file_system_client.get_file_client(file_path)
+        file_client.upload_data(json_data, overwrite=True)
+        
+        logging.info(f"Successfully saved order to Data Lake: {file_path}")
+        return True
+    except Exception as e:
+        logging.error(f"Error saving order {filename} to Data Lake: {e}")
+        return False
+
 def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = None) -> bool:
     """
     Save data to Azure Data Lake Storage
@@ -431,3 +739,32 @@ def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = N
         import traceback
         logging.error(f"Full traceback: {traceback.format_exc()}")
         return False
+
+def _flatten_connection(connection_dict):
+    """Helper function to transform a GraphQL connection ({'edges': [{'node': ...}]}) into a simple list."""
+    if not connection_dict or 'edges' not in connection_dict or not isinstance(connection_dict['edges'], list):
+        return []
+    return [edge['node'] for edge in connection_dict['edges'] if 'node' in edge]
+
+def _transform_order(order):
+    """Transforms a raw order from GraphQL to flatten nested connections."""
+    if not order:
+        return None
+
+    # Flatten lineItems
+    if 'lineItems' in order and order['lineItems']:
+        order['lineItems'] = _flatten_connection(order['lineItems'])
+
+    # Flatten fulfillments and their nested items
+    if 'fulfillments' in order and order['fulfillments']:
+        for fulfillment in order['fulfillments']:
+            if 'fulfillmentLineItems' in fulfillment and fulfillment['fulfillmentLineItems']:
+                fulfillment['fulfillmentLineItems'] = _flatten_connection(fulfillment['fulfillmentLineItems'])
+
+    # Flatten refunds and their nested items
+    if 'refunds' in order and order['refunds']:
+        for refund in order['refunds']:
+            if 'refundLineItems' in refund and refund['refundLineItems']:
+                refund['refundLineItems'] = _flatten_connection(refund['refundLineItems'])
+
+    return order

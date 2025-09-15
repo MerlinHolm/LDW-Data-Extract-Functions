@@ -53,7 +53,6 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
         filename = req.params.get('filename')
         page_size = req.params.get('page_size', '200')
         catalog_id = req.params.get('catalog_id')
-        price_book_id = req.params.get('price_book_id')
 
         if not data_lake_path:
             return func.HttpResponse(
@@ -79,7 +78,7 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
             )
         
         # Fetch combined product data (products + inventory + pricing)
-        product_data = fetch_salesforce_products(access_token, base_url, organization_id, site_id, page_size, catalog_id, price_book_id)
+        product_data = fetch_salesforce_products(access_token, base_url, organization_id, site_id, page_size, catalog_id)
         
         # Check for errors
         items_list = product_data.get('data', [])
@@ -138,6 +137,87 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps(error_response),
             status_code=500,
             mimetype="application/json"
+        )
+
+
+@app.route(route="get_refund_data", auth_level=func.AuthLevel.FUNCTION)
+def get_refund_data(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Processing Salesforce Commerce Cloud refund data request')
+    
+    try:
+        client_id = req.params.get('client_id')
+        client_secret = req.params.get('client_secret')
+        datalake_key = req.params.get('datalake_key')
+        
+        if not all([client_id, client_secret, datalake_key]):
+            return func.HttpResponse(
+                json.dumps({"error": "Missing one or more required parameters: client_id, client_secret, datalake_key"}),
+                status_code=400, mimetype="application/json"
+            )
+            
+        base_url = req.params.get('base_url', 'kv7kzm78.api.commercecloud.salesforce.com')
+        if not base_url.startswith('http'):
+            base_url = f'https://{base_url}'
+        api_version = req.params.get('api_version', 'v1')
+        organization_id = req.params.get('organization_id', 'f_ecom_zysr_001')
+        site_id = req.params.get('site_id', 'RefArchUS')
+        limit = req.params.get('limit', '200')
+        data_lake_path = req.params.get('data_lake_path', 'RetailOrders/input/files/json/refunds')
+        filename_prefix = req.params.get('filename', 'refunds')
+        start_date = req.params.get('start_date')
+        end_date = req.params.get('end_date')
+        
+        access_token = get_salesforce_access_token(client_id, client_secret)
+        if not access_token:
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to obtain access token"}),
+                status_code=401, mimetype="application/json"
+            )
+        
+        # Use the existing orders function which expands payment details
+        order_data = fetch_salesforce_orders(
+            access_token, base_url, api_version, organization_id, 
+            site_id, limit, start_date, end_date
+        )
+        
+        if 'error' in order_data:
+            return func.HttpResponse(
+                json.dumps(order_data), status_code=500, mimetype="application/json"
+            )
+        
+        # The refund data is within the orders, so we treat orders as the source
+        refund_list = order_data.get('data', [])
+        if not refund_list:
+            return func.HttpResponse(
+                json.dumps({"status": "success", "message": "No orders found, so no refund data available"}),
+                status_code=200, mimetype="application/json"
+            )
+        
+        date_for_filename = (start_date.replace('-', '') if start_date else datetime.now().strftime("%Y%m%d"))
+        filename = f"{filename_prefix}.{date_for_filename}-refunds"
+        
+        save_result = save_to_datalake(order_data, datalake_key, data_lake_path, filename)
+        
+        if save_result:
+            response_data = {
+                "status": "success",
+                "message": "Successfully downloaded order data containing refund details and saved to Data Lake",
+                "records_count": len(refund_list),
+                "filename": f"{filename}.json",
+                "path": data_lake_path
+            }
+            return func.HttpResponse(json.dumps(response_data), status_code=200, mimetype="application/json")
+        else:
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to save data to Data Lake"}),
+                status_code=500, mimetype="application/json"
+            )
+            
+    except Exception as e:
+        logging.error(f"Error in get_refund_data: {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": f"Internal server error: {str(e)}"}),
+            status_code=500, mimetype="application/json"
         )
 
 
@@ -353,6 +433,7 @@ def get_salesforce_access_token(client_id: str, client_secret: str) -> str:
         return None
 
 
+
 def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, organization_id: str, site_id: str, limit: str, start_date: str = None, end_date: str = None) -> dict:
     """
     Fetch orders, lines, and shipments from Salesforce Commerce Cloud
@@ -372,12 +453,10 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
         params = {
             'siteId': site_id,
             'count': limit,
-            'start': 0
+            'start': 0,
+            'expand': 'payments,paymentInstruments'  # Attempt to get payment and refund info
         }
 
-        # Add price_book_id refinement if provided
-        # if price_book_id:
-        #     params['refine'] = f'price_book_id={price_book_id}'
 
         # Add date filters if provided
         if start_date and end_date:
@@ -514,7 +593,7 @@ def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = N
         return False
 
 
-def fetch_salesforce_products(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str, catalog_id: str = None, price_book_id: str = None) -> dict:
+def fetch_salesforce_products(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str, catalog_id: str = None) -> dict:
     """
     Fetch products from Salesforce Commerce Cloud Product Search API
     """
@@ -546,6 +625,15 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
                 "availability", "images", "prices"
             ]
         }
+
+        # Add catalog_id refinement if provided
+        # if catalog_id:
+        #     search_query['refinements'] = [
+        #         {
+        #             "attributeId": "catalogId",
+        #             "values": [catalog_id]
+        #         }
+        #     ]
         
         logging.info(f"Fetching products from Salesforce Commerce Cloud: {url}")
         logging.info(f"Search query: {json.dumps(search_query, indent=2)}")
