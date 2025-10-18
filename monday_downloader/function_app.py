@@ -48,11 +48,6 @@ def get_board_data(req: func.HttpRequest) -> func.HttpResponse:
                 status_code=400
             )
         
-        # GraphQL query - exact match to working query format
-        query = {
-            "query": f"query {{ boards (ids: {board_id}) {{ id name description columns {{ id title type }} items_page (limit: 500) {{ cursor items {{ id name column_values {{ id text type value ... on MirrorValue {{id display_value type}} }} subitems {{ id name column_values {{ id text type value ... on MirrorValue {{id display_value type}} }} }} }} }} }} }}"
-        }
-        
         # Headers for Monday.com API
         headers = {
             "Authorization": api_token,
@@ -64,30 +59,105 @@ def get_board_data(req: func.HttpRequest) -> func.HttpResponse:
         api_error = None
         
         try:
-            # Make API request to Monday.com with timeout and retry logic
+            # Make API request to Monday.com with pagination support
             api_url = f"{base_url}/{api_version}"
             logging.info(f"Making request to: {api_url}")
-            logging.info(f"Query being sent: {query}")
             
-            # Retry logic for timeout errors
-            max_retries = 3
-            retry_count = 0
+            # Fetch all pages of data
+            all_items = []
+            all_columns = []
+            board_info = {}
+            cursor = None
+            page_count = 0
+            max_pages = 50  # Safety limit to prevent infinite loops
             
-            while retry_count < max_retries:
-                try:
-                    response = requests.post(api_url, json=query, headers=headers, timeout=60)
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.Timeout:
-                    retry_count += 1
-                    if retry_count >= max_retries:
+            while page_count < max_pages:
+                page_count += 1
+                
+                # Build GraphQL query with cursor for pagination
+                cursor_param = f', cursor: "{cursor}"' if cursor else ''
+                query = {
+                    "query": f"query {{ boards (ids: {board_id}) {{ id name description columns {{ id title type }} items_page (limit: 100{cursor_param}) {{ cursor items {{ id name column_values {{ id text type value ... on MirrorValue {{id display_value type}} }} subitems {{ id name column_values {{ id text type value ... on MirrorValue {{id display_value type}} }} }} }} }} }} }}"
+                }
+                
+                logging.info(f"Fetching page {page_count} with query: {query}")
+                
+                # Retry logic for timeout errors
+                max_retries = 3
+                retry_count = 0
+                
+                while retry_count < max_retries:
+                    try:
+                        response = requests.post(api_url, json=query, headers=headers, timeout=60)
+                        response.raise_for_status()
+                        break
+                    except requests.exceptions.Timeout:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            raise
+                        logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
+                        time.sleep(2 ** retry_count)  # Exponential backoff
+                    except requests.exceptions.RequestException:
                         raise
-                    logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
-                    time.sleep(2 ** retry_count)  # Exponential backoff
-                except requests.exceptions.RequestException:
-                    raise
+                
+                page_data = response.json()
+                
+                # Check for API errors
+                if 'errors' in page_data:
+                    logging.error(f"Monday.com API errors: {page_data['errors']}")
+                    api_error = f"API errors: {page_data['errors']}"
+                    break
+                
+                # Extract board data from first page
+                if page_count == 1 and 'data' in page_data and 'boards' in page_data['data'] and page_data['data']['boards']:
+                    board = page_data['data']['boards'][0]
+                    board_info = {
+                        'id': board.get('id'),
+                        'name': board.get('name'),
+                        'description': board.get('description')
+                    }
+                    all_columns = board.get('columns', [])
+                    logging.info(f"Board info: {board_info}")
+                
+                # Extract items from current page
+                if ('data' in page_data and 'boards' in page_data['data'] and 
+                    page_data['data']['boards'] and 'items_page' in page_data['data']['boards'][0]):
+                    
+                    items_page = page_data['data']['boards'][0]['items_page']
+                    items = items_page.get('items', [])
+                    all_items.extend(items)
+                    
+                    # Count subitems for detailed logging
+                    subitems_count = sum(len(item.get('subitems', [])) for item in items)
+                    logging.info(f"Page {page_count}: Found {len(items)} items with {subitems_count} subitems (Total items so far: {len(all_items)})")
+                    
+                    # Check if there are more pages
+                    cursor = items_page.get('cursor')
+                    if not cursor or len(items) == 0:
+                        total_subitems = sum(len(item.get('subitems', [])) for item in all_items)
+                        logging.info(f"Board data pagination complete after {page_count} pages. Total: {len(all_items)} items, {total_subitems} subitems")
+                        break
+                else:
+                    logging.warning(f"No items found on page {page_count}")
+                    break
             
-            json_data = response.json()
+            # Construct final response with all collected data
+            json_data = {
+                'data': {
+                    'boards': [{
+                        'id': board_info.get('id'),
+                        'name': board_info.get('name'),
+                        'description': board_info.get('description'),
+                        'columns': all_columns,
+                        'items_page': {
+                            'cursor': None,  # No cursor needed since we have all data
+                            'items': all_items
+                        }
+                    }]
+                }
+            }
+            
+            logging.info(f"Successfully fetched {len(all_items)} total items across {page_count} pages")
             
             # Save to Data Lake - use boardID as filename with .json extension
             json_filename_with_ext = f"{board_id}.json"
@@ -255,39 +325,73 @@ def get_file_data(req: func.HttpRequest) -> func.HttpResponse:
             base_url = req_body.get('base_url', 'https://api.monday.com')
             api_version = req_body.get('api_version', 'v2')
             
-            query = {
-                "query": f"query {{ boards (ids: {board_id}) {{ items_page (limit: 500) {{ items {{ id name assets {{ id name url public_url file_extension }} }} }} }} }}"
-            }
+            # Fetch all items with pagination for file downloads
+            all_items = []
+            cursor = None
+            page_count = 0
+            max_pages = 50  # Safety limit
             
-            headers = {
-                "Authorization": api_token,
-                "Content-Type": "application/json"
-            }
-            
-            api_url = f"{base_url}/{api_version}"
-            logging.info(f"Fetching board data from: {api_url}")
-            
-            # Retry logic for timeout errors
-            max_retries = 3
-            retry_count = 0
-            
-            while retry_count < max_retries:
-                try:
-                    response = requests.post(api_url, json=query, headers=headers, timeout=60)
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.Timeout:
-                    retry_count += 1
-                    if retry_count >= max_retries:
+            while page_count < max_pages:
+                page_count += 1
+                
+                cursor_param = f', cursor: "{cursor}"' if cursor else ''
+                query = {
+                    "query": f"query {{ boards (ids: {board_id}) {{ items_page (limit: 100{cursor_param}) {{ cursor items {{ id name assets {{ id name url public_url file_extension }} }} }} }} }}"
+                }
+                
+                logging.info(f"Fetching page {page_count} for file assets")
+                
+                # Retry logic for timeout errors
+                max_retries = 3
+                retry_count = 0
+                
+                while retry_count < max_retries:
+                    try:
+                        response = requests.post(api_url, json=query, headers=headers, timeout=60)
+                        response.raise_for_status()
+                        break
+                    except requests.exceptions.Timeout:
+                        retry_count += 1
+                        if retry_count >= max_retries:
+                            raise
+                        logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
+                        time.sleep(2 ** retry_count)  # Exponential backoff
+                    except requests.exceptions.RequestException:
                         raise
-                    logging.warning(f"Timeout occurred, retrying ({retry_count}/{max_retries})...")
-                    time.sleep(2 ** retry_count)  # Exponential backoff
-                except requests.exceptions.RequestException:
-                    raise
+                
+                page_data = response.json()
+                
+                # Extract items from current page
+                if ('data' in page_data and 'boards' in page_data['data'] and 
+                    page_data['data']['boards'] and 'items_page' in page_data['data']['boards'][0]):
+                    
+                    items_page = page_data['data']['boards'][0]['items_page']
+                    items = items_page.get('items', [])
+                    all_items.extend(items)
+                    
+                    logging.info(f"File assets page {page_count}: Found {len(items)} items (Total so far: {len(all_items)})")
+                    
+                    # Check if there are more pages
+                    cursor = items_page.get('cursor')
+                    if not cursor or len(items) == 0:
+                        logging.info(f"File assets pagination complete after {page_count} pages. Total: {len(all_items)} items")
+                        break
+                else:
+                    logging.warning(f"No items found on page {page_count}")
+                    break
             
-            json_data = response.json()
-            logging.info(f"Successfully fetched board data for board: {board_id}")
-            logging.info(f"API Response: {json.dumps(json_data, indent=2)}")
+            # Create mock response structure for compatibility with existing code
+            json_data = {
+                'data': {
+                    'boards': [{
+                        'items_page': {
+                            'items': all_items
+                        }
+                    }]
+                }
+            }
+            
+            logging.info(f"Successfully fetched {len(all_items)} total items for file processing")
             
         except Exception as e:
             return func.HttpResponse(

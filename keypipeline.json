@@ -1,0 +1,170 @@
+{
+    "name": "RetailOrdersExtractShopify_ShopSync_Key_Pipeline",
+    "properties": {
+        "activities": [
+            {
+                "name": "GetFolderList",
+                "type": "GetMetadata",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "7.00:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "dataset": {
+                        "referenceName": "Json_ShopSync_Shopify",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "file_name": "",
+                            "folder_name": {
+                                "value": "@pipeline().parameters.storeID",
+                                "type": "Expression"
+                            }
+                        }
+                    },
+                    "fieldList": [
+                        "childItems"
+                    ],
+                    "storeSettings": {
+                        "type": "AzureBlobFSReadSettings",
+                        "enablePartitionDiscovery": false
+                    },
+                    "formatSettings": {
+                        "type": "JsonReadSettings"
+                    }
+                }
+            },
+            {
+                "name": "ForEachFolder",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "GetFolderList",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('GetFolderList').output.childItems",
+                        "type": "Expression"
+                    },
+                    "activities": [
+                        {
+                            "name": "ExecuteSubPipeline",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false,
+                                "secureOutput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "RetailOrdersExtractShopify_ShopSync_Key_SubPipeline",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "storeID": {
+                                        "value": "@pipeline().parameters.storeID",
+                                        "type": "Expression"
+                                    },
+                                    "subFolderName": {
+                                        "value": "@item().name",
+                                        "type": "Expression"
+                                    },
+                                    "companyID": {
+                                        "value": "@pipeline().parameters.companyID",
+                                        "type": "Expression"
+                                    },
+                                    "clientID": {
+                                        "value": "@pipeline().parameters.clientID",
+                                        "type": "Expression"
+                                    },
+                                    "client": {
+                                        "value": "@pipeline().parameters.client",
+                                        "type": "Expression"
+                                    },
+                                    "folder": {
+                                        "value": "@pipeline().parameters.folder",
+                                        "type": "Expression"
+                                    },
+                                    "system": {
+                                        "value": "@pipeline().parameters.system",
+                                        "type": "Expression"
+                                    },
+                                    "fileDate": {
+                                        "value": "@pipeline().parameters.fileDate",
+                                        "type": "Expression"
+                                    },
+                                    "item": {
+                                        "value": "@pipeline().parameters.item",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "concurrency": 50,
+        "parameters": {
+            "company": {
+                "type": "string",
+                "defaultValue": "myshopify"
+            },
+            "storeID": {
+                "type": "string",
+                "defaultValue": "CXR003"
+            },
+            "filename": {
+                "type": "string",
+                "defaultValue": "myshopify.CXR003"
+            },
+            "item": {
+                "type": "string",
+                "defaultValue": "orders"
+            },
+            "companyID": {
+                "type": "string",
+                "defaultValue": "1"
+            },
+            "client": {
+                "type": "string",
+                "defaultValue": "CostcoNext"
+            },
+            "clientID": {
+                "type": "string",
+                "defaultValue": "1"
+            },
+            "folder": {
+                "type": "string",
+                "defaultValue": "RetailOrders"
+            },
+            "file": {
+                "type": "string",
+                "defaultValue": ".json"
+            },
+            "system": {
+                "type": "string",
+                "defaultValue": "shopsync"
+            },
+            "fileDate": {
+                "type": "string",
+                "defaultValue": "20251010"
+            }
+        },
+        "folder": {
+            "name": "LiveChannel DW/orders/Shopify"
+        },
+        "annotations": []
+    }
+}

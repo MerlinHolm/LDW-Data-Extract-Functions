@@ -122,6 +122,10 @@ def get_magento_data(req: func.HttpRequest) -> func.HttpResponse:
             # Convert dict back to list
             day_items = list(day_items_dict.values())
             
+            # Enhance order items with variant IDs if processing orders
+            if item == 'orders' and day_items:
+                day_items = enhance_order_items_with_variant_ids(day_items)
+            
             # Save this day's data if we have items
             if day_items:
                 logging.info(f"Saving {len(day_items)} items for {day_str}")
@@ -600,3 +604,88 @@ def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = N
             "success": False,
             "error": str(e)
         }
+
+
+def enhance_order_items_with_variant_ids(orders: list) -> list:
+    """
+    Enhance order line items with variant IDs for easier product joining.
+    For Magento: variant_id = child product_id for configurable products, or product_id for simple products.
+    """
+    enhanced_orders = []
+    
+    for order in orders:
+        enhanced_order = order.copy()
+        order_items = enhanced_order.get('items', [])
+        
+        if order_items:
+            enhanced_items = []
+            
+            for item in order_items:
+                enhanced_item = item.copy()
+                
+                # Determine variant ID based on Magento product structure
+                product_id = item.get('product_id')
+                parent_item_id = item.get('parent_item_id')
+                product_type = item.get('product_type', '')
+                
+                # Logic for variant ID:
+                # - If it has a parent_item_id, it's a child of configurable -> use its product_id as variant_id
+                # - If it's a simple product (no parent), use its product_id as variant_id  
+                # - If it's a configurable parent, variant_id will be null (use children instead)
+                
+                if parent_item_id:
+                    # This is a child item of a configurable product
+                    variant_id = product_id
+                    item_type = 'configurable_child'
+                elif product_type == 'simple':
+                    # This is a standalone simple product
+                    variant_id = product_id
+                    item_type = 'simple'
+                elif product_type == 'configurable':
+                    # This is a configurable parent - don't use for variant matching
+                    variant_id = None
+                    item_type = 'configurable_parent'
+                else:
+                    # Other product types (bundle, etc.)
+                    variant_id = product_id
+                    item_type = product_type or 'unknown'
+                
+                # Insert variant_id right after product_id for better positioning
+                # Create a new ordered dict to control field order
+                ordered_item = {}
+                
+                # Add fields in desired order - variant_id right after product_id
+                for key, value in enhanced_item.items():
+                    ordered_item[key] = value
+                    if key == 'product_id':
+                        ordered_item['variant_id'] = variant_id
+                
+                # Add classification fields at the end if not already present
+                if 'variant_id' not in ordered_item:
+                    ordered_item['variant_id'] = variant_id
+                
+                ordered_item['item_type'] = item_type
+                ordered_item['is_variant'] = variant_id is not None
+                ordered_item['is_configurable_child'] = parent_item_id is not None
+                
+                enhanced_item = ordered_item
+                
+                enhanced_items.append(enhanced_item)
+            
+            enhanced_order['items'] = enhanced_items
+            
+            # Add summary info to the order level
+            total_items = len(enhanced_items)
+            variant_items = len([item for item in enhanced_items if item.get('variant_id')])
+            
+            enhanced_order['items_summary'] = {
+                'total_items': total_items,
+                'variant_items': variant_items,
+                'configurable_parents': len([item for item in enhanced_items if item.get('item_type') == 'configurable_parent']),
+                'configurable_children': len([item for item in enhanced_items if item.get('item_type') == 'configurable_child']),
+                'simple_products': len([item for item in enhanced_items if item.get('item_type') == 'simple'])
+            }
+        
+        enhanced_orders.append(enhanced_order)
+    
+    return enhanced_orders

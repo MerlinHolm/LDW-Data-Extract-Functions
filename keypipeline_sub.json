@@ -1,0 +1,386 @@
+{
+    "name": "RetailOrdersExtractShopify_ShopSync_Key_SubPipeline",
+    "properties": {
+        "activities": [
+            {
+                "name": "GetFileList",
+                "type": "GetMetadata",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "7.00:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "dataset": {
+                        "referenceName": "Json_ShopSync_Shopify",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "file_name": "*.json",
+                            "folder_name": {
+                                "value": "@concat(pipeline().parameters.storeID, '/', pipeline().parameters.subFolderName)",
+                                "type": "Expression"
+                            }
+                        }
+                    },
+                    "fieldList": [
+                        "childItems"
+                    ],
+                    "storeSettings": {
+                        "type": "AzureBlobFSReadSettings",
+                        "enablePartitionDiscovery": false
+                    },
+                    "formatSettings": {
+                        "type": "JsonReadSettings"
+                    }
+                }
+            },
+            {
+                "name": "ForEachFile",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "GetFileList",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('GetFileList').output.childItems",
+                        "type": "Expression"
+                    },
+                    "activities": [
+                        {
+                            "name": "GetFileMetadata",
+                            "type": "GetMetadata",
+                            "dependsOn": [],
+                            "policy": {
+                                "timeout": "7.00:00:00",
+                                "retry": 0,
+                                "retryIntervalInSeconds": 30,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "dataset": {
+                                    "referenceName": "Json_ShopSync_Shopify",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "file_name": "@item().name",
+                                        "folder_name": {
+                                            "value": "@concat(pipeline().parameters.storeID, '/', pipeline().parameters.subFolderName)",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                },
+                                "fieldList": [
+                                    "lastModified"
+                                ],
+                                "storeSettings": {
+                                    "type": "AzureBlobFSReadSettings",
+                                    "enablePartitionDiscovery": false
+                                },
+                                "formatSettings": {
+                                    "type": "JsonReadSettings"
+                                }
+                            }
+                        },
+                        {
+                            "name": "CopyFileWithMetadata",
+                            "type": "Copy",
+                            "dependsOn": [
+                                {
+                                    "activity": "GetFileMetadata",
+                                    "dependencyConditions": [
+                                        "Succeeded"
+                                    ]
+                                }
+                            ],
+                            "policy": {
+                                "timeout": "0.12:00:00",
+                                "retry": 0,
+                                "retryIntervalInSeconds": 30,
+                                "secureOutput": false,
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "source": {
+                                    "type": "JsonSource",
+                                    "additionalColumns": [
+                                        {
+                                            "name": "store_id",
+                                            "value": {
+                                                "value": "@{pipeline().parameters.storeID}",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "dtStamp",
+                                            "value": {
+                                                "value": "@formatDateTime(utcNow(),'yyyy-MM-ddTHH:mm:ss')",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "company_id",
+                                            "value": {
+                                                "value": "@pipeline().parameters.companyID",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "client_id",
+                                            "value": {
+                                                "value": "@pipeline().parameters.clientID",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "client",
+                                            "value": {
+                                                "value": "@pipeline().parameters.client",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "order",
+                                            "value": {
+                                                "value": "@item().name",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "downloadAt",
+                                            "value": {
+                                                "value": "@activity('GetFileMetadata').output.lastModified",
+                                                "type": "Expression"
+                                            }
+                                        },
+                                        {
+                                            "name": "subfolder",
+                                            "value": {
+                                                "value": "@pipeline().parameters.subFolderName",
+                                                "type": "Expression"
+                                            }
+                                        }
+                                    ],
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSReadSettings",
+                                        "recursive": false,
+                                        "enablePartitionDiscovery": false
+                                    },
+                                    "formatSettings": {
+                                        "type": "JsonReadSettings"
+                                    }
+                                },
+                                "sink": {
+                                    "type": "ParquetSink",
+                                    "storeSettings": {
+                                        "type": "AzureBlobFSWriteSettings"
+                                    },
+                                    "formatSettings": {
+                                        "type": "ParquetWriteSettings"
+                                    }
+                                },
+                                "enableStaging": false,
+                                "translator": {
+                                    "type": "TabularTranslator",
+                                    "mappings": [
+                                        {
+                                            "source": {
+                                                "path": "$['company_id']"
+                                            },
+                                            "sink": {
+                                                "name": "company_id",
+                                                "type": "String"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['client_id']"
+                                            },
+                                            "sink": {
+                                                "name": "client_id",
+                                                "type": "String"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['store_id']"
+                                            },
+                                            "sink": {
+                                                "name": "store_id",
+                                                "type": "String"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['id']"
+                                            },
+                                            "sink": {
+                                                "name": "order_id",
+                                                "type": "String"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['order']"
+                                            },
+                                            "sink": {
+                                                "name": "order",
+                                                "type": "String"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['createdAt']"
+                                            },
+                                            "sink": {
+                                                "name": "createdAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['processedAt']"
+                                            },
+                                            "sink": {
+                                                "name": "processedAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['updatedAt']"
+                                            },
+                                            "sink": {
+                                                "name": "updatedAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['closedAt']"
+                                            },
+                                            "sink": {
+                                                "name": "closedAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['cancelledAt']"
+                                            },
+                                            "sink": {
+                                                "name": "cancelledAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['downloadAt']"
+                                            },
+                                            "sink": {
+                                                "name": "downloadAt",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['dtStamp']"
+                                            },
+                                            "sink": {
+                                                "name": "dtStamp",
+                                                "type": "DateTime"
+                                            }
+                                        },
+                                        {
+                                            "source": {
+                                                "path": "$['subfolder']"
+                                            },
+                                            "sink": {
+                                                "name": "subfolder",
+                                                "type": "String"
+                                            }
+                                        }
+                                    ]
+                                }
+                            },
+                            "inputs": [
+                                {
+                                    "referenceName": "Json_ShopSync_Shopify",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "file_name": "@item().name",
+                                        "folder_name": {
+                                            "value": "@concat(pipeline().parameters.storeID, '/', pipeline().parameters.subFolderName)",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "referenceName": "Parquet_Input",
+                                    "type": "DatasetReference",
+                                    "parameters": {
+                                        "file_name": {
+                                            "value": "@concat(pipeline().parameters.system, '/keys/', pipeline().parameters.fileDate, '/', pipeline().parameters.item, '/', pipeline().parameters.subFolderName, '/', item().name, '.parquet')",
+                                            "type": "Expression"
+                                        },
+                                        "folder_name": {
+                                            "value": "@pipeline().parameters.folder",
+                                            "type": "Expression"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ],
+        "concurrency": 50,
+        "parameters": {
+            "storeID": {
+                "type": "string"
+            },
+            "subFolderName": {
+                "type": "string"
+            },
+            "companyID": {
+                "type": "string"
+            },
+            "clientID": {
+                "type": "string"
+            },
+            "client": {
+                "type": "string"
+            },
+            "folder": {
+                "type": "string"
+            },
+            "system": {
+                "type": "string"
+            },
+            "fileDate": {
+                "type": "string"
+            },
+            "item": {
+                "type": "string"
+            }
+        },
+        "folder": {
+            "name": "LiveChannel DW/orders/Shopify"
+        },
+        "annotations": []
+    }
+}

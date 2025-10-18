@@ -2,6 +2,7 @@ import azure.functions as func
 import json
 import logging
 import requests
+import re
 from datetime import datetime
 from azure.storage.filedatalake import DataLakeServiceClient
 import base64
@@ -413,95 +414,123 @@ def fetch_product_specific_data(headers: dict, base_url: str, api_version: str, 
 def get_status_data(req: func.HttpRequest) -> func.HttpResponse:
     """
     BigCommerce Order Status Data Downloader
-    Downloads comprehensive order status information including fulfillment progress
+    Downloads order status information matching Shopify function structure
     """
     logging.info('BigCommerce status data download function processed a request.')
 
     try:
-        # Get parameters from request
-        base_url = req.params.get('base_url')  # e.g., api.bigcommerce.com/stores/lb2chb77ok
+        # Get parameters from request (matching Shopify structure)
         auth_token = req.params.get('auth_token')
+        base_url = req.params.get('base_url')  # Store hash like 'lb2chb77ok'
         datalake_key = req.params.get('datalake_key')
-        data_lake_path = req.params.get('data_lake_path', 'Retail/BigCommerce/Status')
-        filename_prefix = req.params.get('filename', 'bigcommerce-status')
+        data_lake_path = req.params.get('data_lake_path', 'Retail/BigCommerce/OrderStatus')
+        page_size = req.params.get('page_size', '250')
         
-        # Date filters
-        min_date_created = req.params.get('min_date_created')
-        max_date_created = req.params.get('max_date_created')
-        
-        # Status type filter
-        status_type = req.params.get('status_type', 'comprehensive')  # comprehensive, orders_only, fulfillment_only
+        # BigCommerce equivalent of Shopify's order_number filter
+        order_id_raw = req.params.get('order_id')
+        order_id = None
+        if order_id_raw:
+            # Clean and validate order ID
+            numeric_order_id = re.sub(r'\D', '', order_id_raw)
+            if numeric_order_id:
+                order_id = numeric_order_id
+            else:
+                return func.HttpResponse(
+                    json.dumps({"status": "error", "message": "Invalid order_id parameter: must contain digits."}),
+                    status_code=400, mimetype="application/json"
+                )
 
-        # Validate required parameters
-        if not all([base_url, auth_token, datalake_key]):
+        # Date filters (matching Shopify naming)
+        created_at_min = req.params.get('created_at_min')
+        created_at_max = req.params.get('created_at_max')
+        updated_at_min = req.params.get('updated_at_min')
+        updated_at_max = req.params.get('updated_at_max')
+
+        # Validate required parameters (matching Shopify error format)
+        if not all([auth_token, base_url, datalake_key]):
             return func.HttpResponse(
-                json.dumps({"error": "base_url, auth_token, and datalake_key are required"}),
-                status_code=400,
-                mimetype="application/json"
+                json.dumps({"error": "MISSING_PARAMETER", "message": "auth_token, base_url, and datalake_key are required"}),
+                status_code=400, mimetype="application/json"
             )
 
+        # Construct BigCommerce API URL
         if not base_url.startswith('http'):
-            base_url = f"https://api.bigcommerce.com/stores/{base_url}"
+            full_base_url = f"https://api.bigcommerce.com/stores/{base_url}"
+        else:
+            full_base_url = base_url
+            
+        logging.info(f"Fetching BigCommerce order status data from: {full_base_url}")
 
-        logging.info(f"Processing BigCommerce status data - type: {status_type}")
-
-        # Fetch comprehensive status data
-        status_data = fetch_comprehensive_status_data(
-            auth_token=auth_token,
-            base_url=base_url,
-            status_type=status_type,
-            min_date_created=min_date_created,
-            max_date_created=max_date_created
-        )
+        # Fetch BigCommerce status data (equivalent to fetch_shopify_statuses)
+        status_data = fetch_bigcommerce_statuses(auth_token, full_base_url, page_size, order_id, created_at_min, created_at_max, updated_at_min, updated_at_max)
 
         if 'error' in status_data:
-            return func.HttpResponse(
-                json.dumps(status_data),
-                status_code=500,
-                mimetype="application/json"
-            )
+            return func.HttpResponse(json.dumps(status_data), status_code=500, mimetype="application/json")
 
-        items_list = status_data.get('data', [])
-        has_items = len(items_list) > 0
-
-        if not has_items:
-            return func.HttpResponse(
-                json.dumps({"status": "success", "message": f"No status data found.", "records_count": 0}),
-                status_code=200,
-                mimetype="application/json"
-            )
-
-        # Filename based on status type
-        filename = f"{filename_prefix}-{status_type}"
-
-        save_result = save_to_datalake(status_data, datalake_key, data_lake_path, filename)
-
-        if save_result:
-            response_data = {
-                "status": "success",
-                "message": f"Successfully downloaded and saved {status_type} status data",
-                "records_count": len(items_list),
-                "filename": f"{filename}.json",
-                "path": data_lake_path
+        orders = status_data.get('data', [])
+        if not orders:
+            # Include debugging information in the response when no orders found (matching Shopify)
+            debug_info = {
+                "status": "success", 
+                "message": "No new order statuses found.", 
+                "records_count": 0,
+                "debug_info": {
+                    "created_at_min": created_at_min,
+                    "created_at_max": created_at_max,
+                    "updated_at_min": updated_at_min,
+                    "updated_at_max": updated_at_max,
+                    "order_id": order_id,
+                    "query_filter_used": status_data.get('query_filter_used', 'Not available'),
+                    "total_pages_checked": status_data.get('total_pages_checked', 'Not available')
+                }
             }
-            return func.HttpResponse(
-                json.dumps(response_data),
-                status_code=200,
-                mimetype="application/json"
-            )
-        else:
-            return func.HttpResponse(
-                json.dumps({"error": "Failed to save data to Data Lake"}),
-                status_code=500,
-                mimetype="application/json"
-            )
+            return func.HttpResponse(json.dumps(debug_info), status_code=200, mimetype="application/json")
+
+        saved_files = []
+        failed_files = []
+        for raw_order in orders:
+            # Transform BigCommerce order data (equivalent to _transform_order)
+            order = _transform_bigcommerce_order(raw_order)
+            if not order:
+                logging.warning("Skipping an order that failed transformation.")
+                continue
+
+            # Use order ID as filename (BigCommerce equivalent of Shopify's order name)
+            order_id_for_filename = order.get('id')
+            if order_id_for_filename:
+                filename = str(order_id_for_filename)
+                
+                if filename:
+                    if save_to_datalake(order, datalake_key, data_lake_path, filename):
+                        saved_files.append(f"{filename}.json")
+                    else:
+                        failed_files.append(f"{filename}.json")
+                else:
+                    fallback_id = order.get('id', 'unknown_id')
+                    logging.warning(f"Could not generate a valid filename from order ID: '{order_id_for_filename}'. Fallback ID: {fallback_id}")
+                    failed_files.append(f"FAILED_INVALID_ID(id_{fallback_id})")
+            else:
+                fallback_id = order.get('id', 'unknown_id')
+                logging.warning(f"Order is missing 'id' field. Cannot save file. Fallback ID: {fallback_id}")
+                failed_files.append(f"FAILED_NO_ID(id_{fallback_id})")
+
+        response_data = {
+            "status": "partial_success" if failed_files else "success",
+            "message": f"Processed {len(orders)} order statuses.",
+            "records_saved": len(saved_files),
+            "records_failed": len(failed_files),
+            "failed_files": failed_files,
+            "path": data_lake_path
+        }
+        
+        return func.HttpResponse(json.dumps(response_data), status_code=200, mimetype="application/json")
 
     except Exception as e:
-        logging.error(f"Error in get_status_data: {str(e)}")
+        logging.error(f"Unexpected error in get_status_data: {str(e)}")
+        import traceback
         return func.HttpResponse(
-            json.dumps({"error": f"Internal server error: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json"
+            json.dumps({"error": "UNEXPECTED_ERROR", "message": str(e), "traceback": traceback.format_exc()}),
+            status_code=500, mimetype="application/json"
         )
 
 
@@ -714,6 +743,215 @@ def fetch_fulfillment_lines(auth_token: str, base_url: str, page_size: str, min_
             fulfillment_lines.append(line_item)
     
     return fulfillment_lines
+
+
+def fetch_bigcommerce_statuses(auth_token: str, base_url: str, page_size: str, order_id: str = None, created_at_min: str = None, created_at_max: str = None, updated_at_min: str = None, updated_at_max: str = None) -> dict:
+    """
+    Fetch BigCommerce order status data (equivalent to fetch_shopify_statuses)
+    """
+    try:
+        logging.info(f"Starting BigCommerce status data fetch...")
+        
+        # Build query parameters
+        params = {'limit': page_size}
+        
+        # Add date filters if provided
+        if created_at_min:
+            params['min_date_created'] = created_at_min
+        if created_at_max:
+            params['max_date_created'] = created_at_max
+        if updated_at_min:
+            params['min_date_modified'] = updated_at_min
+        if updated_at_max:
+            params['max_date_modified'] = updated_at_max
+            
+        # Add order ID filter if provided
+        query_filter_used = []
+        if order_id:
+            # For BigCommerce, we can filter by specific order ID
+            endpoint = f"/v2/orders/{order_id}"
+            query_filter_used.append(f"order_id:{order_id}")
+        else:
+            endpoint = "/v2/orders"
+            if created_at_min:
+                query_filter_used.append(f"created_at:>={created_at_min}")
+            if created_at_max:
+                query_filter_used.append(f"created_at:<={created_at_max}")
+            if updated_at_min:
+                query_filter_used.append(f"updated_at:>={updated_at_min}")
+            if updated_at_max:
+                query_filter_used.append(f"updated_at:<={updated_at_max}")
+        
+        logging.info(f"Constructed BigCommerce Query Filter: '{' AND '.join(query_filter_used)}'")
+        
+        # Fetch data using existing v2 fetcher
+        if order_id:
+            # Single order fetch
+            headers = {
+                'X-Auth-Token': auth_token,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+            url = f"{base_url}{endpoint}"
+            response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                order_data = response.json()
+                all_orders = [order_data] if order_data else []
+                total_pages_checked = 1
+            else:
+                logging.error(f"API request failed with status {response.status_code}")
+                return {
+                    "error": "API_CALL_FAILED",
+                    "status_code": response.status_code,
+                    "response_text": response.text
+                }
+        else:
+            # Multiple orders fetch
+            all_orders = fetch_v2_data(auth_token, base_url, endpoint, page_size, created_at_min, created_at_max)
+            if isinstance(all_orders, dict) and 'error' in all_orders:
+                return all_orders
+            total_pages_checked = "multiple"
+        
+        # Enhance each order with line items and shipments status
+        enhanced_orders = []
+        headers = {
+            'X-Auth-Token': auth_token,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        
+        for order in all_orders:
+            order_id = order.get('id')
+            if not order_id:
+                enhanced_orders.append(order)
+                continue
+                
+            enhanced_order = order.copy()
+            
+            try:
+                # Fetch line items with status information
+                line_items_url = f"{base_url}/v2/orders/{order_id}/products"
+                line_response = requests.get(line_items_url, headers=headers, timeout=30)
+                if line_response.status_code == 200:
+                    line_items = line_response.json()
+                    # Just include the raw line items with all quantity columns for SQL analysis
+                    enhanced_order['line_items_with_status'] = line_items
+                else:
+                    logging.warning(f"Failed to fetch line items for order {order_id}: {line_response.status_code}")
+                    enhanced_order['line_items_with_status'] = []
+                
+                # Fetch shipments with status information
+                shipments_url = f"{base_url}/v2/orders/{order_id}/shipments"
+                shipment_response = requests.get(shipments_url, headers=headers, timeout=30)
+                if shipment_response.status_code == 200:
+                    shipments = shipment_response.json()
+                    # Just include the raw shipments with all tracking/date columns for SQL analysis
+                    enhanced_order['shipments_with_status'] = shipments
+                else:
+                    logging.warning(f"Failed to fetch shipments for order {order_id}: {shipment_response.status_code}")
+                    enhanced_order['shipments_with_status'] = []
+                    
+            except Exception as e:
+                logging.error(f"Error enhancing order {order_id}: {str(e)}")
+                enhanced_order['line_items_with_status'] = []
+                enhanced_order['shipments_with_status'] = []
+            
+            enhanced_orders.append(enhanced_order)
+        
+        logging.info(f"Completed BigCommerce status fetch with line items and shipments. Total orders: {len(enhanced_orders)}")
+        
+        return {
+            "data": enhanced_orders,
+            "total_count": len(enhanced_orders),
+            "query_filter_used": ' AND '.join(query_filter_used) if query_filter_used else 'No filters',
+            "total_pages_checked": total_pages_checked
+        }
+        
+    except Exception as e:
+        logging.error(f"Error fetching BigCommerce statuses: {str(e)}")
+        import traceback
+        return {"error": "FETCH_ERROR", "message": str(e), "traceback": traceback.format_exc()}
+
+
+def _transform_bigcommerce_order(raw_order: dict) -> dict:
+    """
+    Transform BigCommerce order data (equivalent to Shopify's _transform_order)
+    Flattens nested data and adds status fields at each level
+    """
+    if not raw_order:
+        return None
+        
+    try:
+        # Start with the raw order data
+        transformed_order = raw_order.copy()
+        
+        # Add line items with only essential fields
+        if 'line_items_with_status' in transformed_order:
+            line_items = transformed_order['line_items_with_status']
+            # Keep only essential line item fields
+            minimal_line_items = []
+            for item in line_items:
+                minimal_item = {
+                    'id': item.get('id'),
+                    'order_id': item.get('order_id'),
+                    'product_id': item.get('product_id'),
+                    'name': item.get('name'),
+                    'quantity': item.get('quantity'),
+                    'quantity_shipped': item.get('quantity_shipped'),
+                    'quantity_refunded': item.get('quantity_refunded'),
+                    'is_refunded': item.get('is_refunded')
+                }
+                minimal_line_items.append(minimal_item)
+            transformed_order['lineItems'] = minimal_line_items
+            del transformed_order['line_items_with_status']
+        
+        # Add shipments with only essential fields
+        if 'shipments_with_status' in transformed_order:
+            shipments = transformed_order['shipments_with_status']
+            # Keep only essential shipment fields
+            minimal_shipments = []
+            for shipment in shipments:
+                minimal_shipment = {
+                    'id': shipment.get('id'),
+                    'order_id': shipment.get('order_id'),
+                    'date_created': shipment.get('date_created')
+                }
+                minimal_shipments.append(minimal_shipment)
+            transformed_order['fulfillments'] = minimal_shipments
+            del transformed_order['shipments_with_status']
+        
+        # Keep only essential order fields
+        essential_order = {
+            'id': transformed_order.get('id'),
+            'status': transformed_order.get('status'),
+            'status_id': transformed_order.get('status_id'),
+            'custom_status': transformed_order.get('custom_status'),
+            'is_deleted': transformed_order.get('is_deleted'),
+            'payment_status': transformed_order.get('payment_status'),
+            'items_total': transformed_order.get('items_total'),
+            'items_shipped': transformed_order.get('items_shipped'),
+            'date_created': transformed_order.get('date_created'),
+            'date_modified': transformed_order.get('date_modified'),
+            'date_shipped': transformed_order.get('date_shipped')
+        }
+        
+        # Add line items and fulfillments to essential order
+        if 'lineItems' in transformed_order:
+            essential_order['lineItems'] = transformed_order['lineItems']
+        if 'fulfillments' in transformed_order:
+            essential_order['fulfillments'] = transformed_order['fulfillments']
+        
+        # Ensure we have an ID for filename generation
+        if not essential_order.get('id'):
+            logging.warning("Order missing ID field")
+            return None
+            
+        return essential_order
+        
+    except Exception as e:
+        logging.error(f"Error transforming BigCommerce order: {str(e)}")
+        return None
 
 
 def fetch_order_status_history(auth_token: str, base_url: str, page_size: str, min_date: str = None, max_date: str = None) -> list:
@@ -1036,6 +1274,104 @@ def calculate_shipping_timeline(fulfillment: dict) -> dict:
     except Exception as e:
         logging.warning(f"Error calculating shipping timeline: {e}")
         return {'error': 'timeline_calculation_failed'}
+
+
+def analyze_line_item_status(line_item: dict) -> dict:
+    """
+    Analyze line item status and fulfillment information.
+    """
+    quantity = line_item.get('quantity', 0)
+    quantity_shipped = line_item.get('quantity_shipped', 0)
+    quantity_refunded = line_item.get('quantity_refunded', 0)
+    is_refunded = line_item.get('is_refunded', False)
+    
+    # Calculate fulfillment status for this line item
+    if quantity == 0:
+        fulfillment_status = 'no_quantity'
+        fulfillment_percentage = 0
+    elif quantity_shipped >= quantity:
+        fulfillment_status = 'fully_shipped'
+        fulfillment_percentage = 100
+    elif quantity_shipped > 0:
+        fulfillment_status = 'partially_shipped'
+        fulfillment_percentage = round((quantity_shipped / quantity) * 100, 2)
+    else:
+        fulfillment_status = 'pending_shipment'
+        fulfillment_percentage = 0
+    
+    # Calculate refund status
+    refund_percentage = round((quantity_refunded / quantity) * 100, 2) if quantity > 0 else 0
+    
+    return {
+        'fulfillment_status': fulfillment_status,
+        'fulfillment_percentage': fulfillment_percentage,
+        'quantity_ordered': quantity,
+        'quantity_shipped': quantity_shipped,
+        'quantity_pending': max(0, quantity - quantity_shipped),
+        'refund_status': {
+            'is_refunded': is_refunded,
+            'quantity_refunded': quantity_refunded,
+            'refund_percentage': refund_percentage
+        },
+        'line_item_complete': quantity_shipped >= quantity,
+        'requires_attention': quantity_shipped == 0 and quantity > 0
+    }
+
+
+def analyze_shipment_status(shipment: dict) -> dict:
+    """
+    Analyze shipment status and tracking information.
+    """
+    tracking_number = shipment.get('tracking_number', '')
+    shipping_method = shipment.get('shipping_method', '')
+    date_created = shipment.get('date_created')
+    items = shipment.get('items', [])
+    
+    # Calculate shipment completeness
+    total_items_in_shipment = len(items)
+    
+    # Tracking analysis
+    has_tracking = bool(tracking_number)
+    tracking_carrier = shipment.get('shipping_provider', 'Unknown')
+    
+    # Calculate shipment age
+    shipment_age_hours = None
+    if date_created:
+        try:
+            from datetime import datetime, timezone
+            import dateutil.parser
+            created_dt = dateutil.parser.parse(date_created)
+            now = datetime.now(timezone.utc)
+            shipment_age_hours = round((now - created_dt).total_seconds() / 3600, 2)
+        except Exception as e:
+            logging.warning(f"Error calculating shipment age: {e}")
+    
+    # Determine shipment status
+    if has_tracking:
+        shipment_status = 'shipped_with_tracking'
+    elif date_created:
+        shipment_status = 'shipped_no_tracking'
+    else:
+        shipment_status = 'preparing'
+    
+    return {
+        'shipment_status': shipment_status,
+        'tracking_info': {
+            'has_tracking': has_tracking,
+            'tracking_number': tracking_number,
+            'carrier': tracking_carrier,
+            'shipping_method': shipping_method
+        },
+        'shipment_details': {
+            'items_count': total_items_in_shipment,
+            'date_created': date_created,
+            'age_hours': shipment_age_hours
+        },
+        'delivery_status': {
+            'is_trackable': has_tracking,
+            'estimated_delivery': None  # Could be enhanced with carrier-specific logic
+        }
+    }
 
 
 def calculate_fulfillment_progress(order: dict) -> dict:

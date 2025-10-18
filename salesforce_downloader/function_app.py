@@ -40,15 +40,26 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
         
-        # Get other parameters with defaults
-        base_url = req.params.get('base_url', 'kv7kzm78.api.commercecloud.salesforce.com')
+        # Get other parameters with defaults (updated for new SFCC configuration)
+        short_code = req.params.get('short_code', 'zxvetsfd')
+        realm_id = req.params.get('realm_id', 'aaue')
+        instance_id = req.params.get('instance_id', 'prd')
         
-        # Add https:// prefix if not present
-        if not base_url.startswith('http://') and not base_url.startswith('https://'):
+        # Build base_url from short_code or use provided base_url
+        base_url = req.params.get('base_url')
+        if not base_url:
+            base_url = f'https://{short_code}.api.commercecloud.salesforce.com'
+        elif not base_url.startswith('http://') and not base_url.startswith('https://'):
             base_url = f'https://{base_url}'
+            
         api_version = req.params.get('api_version', 'v1')
-        organization_id = req.params.get('organization_id', 'f_ecom_zysr_001')
-        site_id = req.params.get('site_id', 'RefArchGlobal')
+        
+        # Build organization_id from realm_id and instance_id or use provided
+        organization_id = req.params.get('organization_id')
+        if not organization_id:
+            organization_id = f'f_ecom_{realm_id}_{instance_id}'
+            
+        site_id = req.params.get('site_id', 'samsonitecostco')
         data_lake_path = req.params.get('data_lake_path')
         filename = req.params.get('filename')
         page_size = req.params.get('page_size', '200')
@@ -69,7 +80,7 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
             )
         
         # Get OAuth token
-        access_token = get_salesforce_access_token(client_id, client_secret)
+        access_token = get_salesforce_access_token(client_id, client_secret, realm_id, instance_id)
         if not access_token:
             return func.HttpResponse(
                 json.dumps({"error": "Failed to obtain access token", "debug": "Check OAuth2 credentials and endpoint"}),
@@ -252,15 +263,26 @@ def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
         
-        # Get other parameters with defaults
-        base_url = req.params.get('base_url', 'kv7kzm78.api.commercecloud.salesforce.com')
+        # Get other parameters with defaults (updated for new SFCC configuration)
+        short_code = req.params.get('short_code', 'zxvetsfd')
+        realm_id = req.params.get('realm_id', 'aaue')
+        instance_id = req.params.get('instance_id', 'prd')
         
-        # Add https:// prefix if not present
-        if not base_url.startswith('http://') and not base_url.startswith('https://'):
+        # Build base_url from short_code or use provided base_url
+        base_url = req.params.get('base_url')
+        if not base_url:
+            base_url = f'https://{short_code}.api.commercecloud.salesforce.com'
+        elif not base_url.startswith('http://') and not base_url.startswith('https://'):
             base_url = f'https://{base_url}'
+            
         api_version = req.params.get('api_version', 'v1')
-        organization_id = req.params.get('organization_id', 'f_ecom_zysr_001')
-        site_id = req.params.get('site_id', 'RefArchUS')
+        
+        # Build organization_id from realm_id and instance_id or use provided
+        organization_id = req.params.get('organization_id')
+        if not organization_id:
+            organization_id = f'f_ecom_{realm_id}_{instance_id}'
+            
+        site_id = req.params.get('site_id', 'samsonitecostco')
         limit = req.params.get('limit', '200')
         data_lake_path = req.params.get('data_lake_path', 'RetailOrders/input/files/json/orders')
         filename_prefix = req.params.get('filename', 'orders')
@@ -268,7 +290,7 @@ def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
         end_date = req.params.get('end_date')
         
         # Step 1: Get OAuth2 access token
-        access_token = get_salesforce_access_token(client_id, client_secret)
+        access_token = get_salesforce_access_token(client_id, client_secret, realm_id, instance_id)
         if not access_token:
             return func.HttpResponse(
                 json.dumps({"error": "Failed to obtain access token", "debug": "Check OAuth2 credentials and endpoint"}),
@@ -290,7 +312,7 @@ def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
         
         if not orders_data:
             # Construct the full URL that would be called for debugging
-            debug_url = f"{base_url}/checkout/orders/{api_version}/organizations/{organization_id}/orders?siteId={site_id}&limit={limit}"
+            debug_url = f"{base_url}/checkout/orders/{api_version}/organizations/{organization_id}/orders?siteId={site_id}&exportStatus=exported&limit={limit}"
             if start_date and end_date:
                 debug_url += f"&creationDateFrom={start_date}&creationDateTo={end_date}"
             
@@ -304,6 +326,7 @@ def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
                         "full_url_with_params": debug_url,
                         "parameters": {
                             "siteId": site_id,
+                            "exportStatus": "exported",
                             "limit": limit,
                             "creationDateFrom": start_date,
                             "creationDateTo": end_date
@@ -391,7 +414,7 @@ def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-def get_salesforce_access_token(client_id: str, client_secret: str) -> str:
+def get_salesforce_access_token(client_id: str, client_secret: str, realm_id: str = 'aaue', instance_id: str = 'prd') -> str:
     """
     Get OAuth2 access token from Salesforce Commerce Cloud
     """
@@ -405,9 +428,11 @@ def get_salesforce_access_token(client_id: str, client_secret: str) -> str:
             'Authorization': f'Basic {base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()}'
         }
         
+        # Build scope using provided realm_id and instance_id
+        # Include both orders and products scopes for comprehensive access
         data = {
             'grant_type': 'client_credentials',
-            'scope': 'SALESFORCE_COMMERCE_API:zysr_001 sfcc.orders.rw sfcc.products'
+            'scope': f'SALESFORCE_COMMERCE_API:{realm_id}_{instance_id} sfcc.orders sfcc.products'
         }
         
         logging.info(f"Requesting access token from Salesforce. URL: {token_url}")
@@ -436,10 +461,10 @@ def get_salesforce_access_token(client_id: str, client_secret: str) -> str:
 
 def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, organization_id: str, site_id: str, limit: str, start_date: str = None, end_date: str = None) -> dict:
     """
-    Fetch orders, lines, and shipments from Salesforce Commerce Cloud
+    Fetch orders from Salesforce Commerce Cloud using the new SFCC API endpoints
     """
     try:
-        # Build the API URL
+        # Build the API URL using the new SFCC format
         api_path = f"/checkout/orders/{api_version}"
         url = f"{base_url}{api_path}/organizations/{organization_id}/orders"
         
@@ -449,16 +474,14 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
             'Content-Type': 'application/json'
         }
         
-        # Prepare query parameters
+        # Prepare query parameters using the new SFCC format
         params = {
             'siteId': site_id,
-            'count': limit,
-            'start': 0,
-            'expand': 'payments,paymentInstruments'  # Attempt to get payment and refund info
+            'limit': limit,
+            'exportStatus': 'exported'  # Use exportStatus filter as shown in the working query
         }
 
-
-        # Add date filters if provided
+        # Add date filters if provided (keeping original parameter names for compatibility)
         if start_date and end_date:
             params['creationDateFrom'] = start_date
             params['creationDateTo'] = end_date
@@ -469,7 +492,7 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
         
         all_orders = []
         offset = 0
-        max_pages = 10  # Safety limit to prevent infinite loops
+        max_pages = 100  # Increased safety limit to handle larger datasets
         page_count = 0
         
         while page_count < max_pages:
@@ -479,6 +502,8 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
             page_count += 1
             
             logging.info(f"Making API call - Page {page_count}, Offset: {offset}")
+            logging.info(f"Full URL: {url}")
+            logging.info(f"Parameters: {current_params}")
             
             response = requests.get(url, headers=headers, params=current_params, timeout=30)
             
@@ -487,20 +512,60 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
             
             if response.status_code == 200:
                 data = response.json()
-                orders = data.get('data', [])
                 
-                logging.info(f"API Response Data Keys: {list(data.keys()) if data else 'None'}")
+                # Handle different response structures from SFCC API
+                orders = []
+                if isinstance(data, dict):
+                    # Check for different possible data keys
+                    orders = data.get('data', data.get('orders', data.get('hits', [])))
+                elif isinstance(data, list):
+                    orders = data
+                
+                logging.info(f"API Response Data Keys: {list(data.keys()) if isinstance(data, dict) else 'List response'}")
+                logging.info(f"Orders found in response: {len(orders)}")
                 
                 if not orders:
                     logging.info("No orders found in response, breaking pagination loop")
                     break
-                    
-                all_orders.extend(orders)
-                logging.info(f"Fetched {len(orders)} orders (total: {len(all_orders)})")
                 
-                # Check if there are more pages
+                # Enhance each order with individual order details if needed
+                enhanced_orders = []
+                for order in orders:
+                    try:
+                        # Get individual order details if we have an order number/ID
+                        order_id = order.get('orderNo') or order.get('id') or order.get('orderNumber')
+                        if order_id:
+                            detailed_order = fetch_individual_order(access_token, base_url, api_version, organization_id, site_id, order_id)
+                            if detailed_order:
+                                enhanced_orders.append(detailed_order)
+                            else:
+                                enhanced_orders.append(order)  # Use original if detailed fetch fails
+                        else:
+                            enhanced_orders.append(order)
+                    except Exception as e:
+                        logging.warning(f"Failed to enhance order {order.get('orderNo', 'unknown')}: {str(e)}")
+                        enhanced_orders.append(order)  # Use original if enhancement fails
+                
+                all_orders.extend(enhanced_orders)
+                logging.info(f"Fetched {len(enhanced_orders)} orders (total: {len(all_orders)})")
+                
+                # Check API response for pagination info
+                total_count = data.get('total', data.get('count', None))
+                if total_count:
+                    logging.info(f"API reports total available: {total_count}")
+                    if len(all_orders) >= total_count:
+                        logging.info(f"Fetched all available orders: {len(all_orders)}/{total_count}")
+                        break
+                
+                # Check if there are more pages (standard pagination check)
                 if len(orders) < int(limit):
                     logging.info(f"Received {len(orders)} orders, less than limit {limit}. Ending pagination.")
+                    break
+                
+                # Check for next page indicators
+                has_more = data.get('hasMore', data.get('has_more', True))
+                if not has_more:
+                    logging.info("API indicates no more pages available")
                     break
                     
                 offset += int(limit)
@@ -517,24 +582,376 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
                     "response_text": response.text,
                     "response_headers": dict(response.headers),
                     "request_url": url,
-                    "request_params": current_params
+                    "request_params": current_params,
+                    "debug_info": {
+                        "expected_url_format": f"{base_url}/checkout/orders/v1/organizations/{organization_id}/orders?siteId={site_id}&exportStatus=exported&limit=200",
+                        "working_example": "https://zxvetsfd.api.commercecloud.salesforce.com/checkout/orders/v1/organizations/f_ecom_aaue_prd/orders?siteId=samsonitecostco&exportStatus=exported&limit=200"
+                    }
                 }
         
         result = {
             'data': all_orders,
             'total_count': len(all_orders),
-            'fetch_timestamp': datetime.now().isoformat()
+            'fetch_timestamp': datetime.now().isoformat(),
+            'metadata': {
+                'api_endpoint': url,
+                'organization_id': organization_id,
+                'site_id': site_id,
+                'pages_fetched': page_count,
+                'parameters_used': params
+            }
         }
         
         if page_count >= max_pages:
             logging.warning(f"Reached maximum page limit ({max_pages}). May have more data available.")
+            logging.warning(f"Consider increasing max_pages or using date filters to reduce dataset size.")
         
         logging.info(f"Successfully fetched {len(all_orders)} orders from Salesforce in {page_count} pages")
+        logging.info(f"Final pagination stats: Pages={page_count}, Max Pages={max_pages}, Orders per page avg={len(all_orders)/page_count if page_count > 0 else 0:.1f}")
         return result
         
     except Exception as e:
         logging.error(f"Error fetching Salesforce orders: {str(e)}")
         return None
+
+
+def fetch_individual_order(access_token: str, base_url: str, api_version: str, organization_id: str, site_id: str, order_id: str) -> dict:
+    """
+    Fetch comprehensive order details from Salesforce Commerce Cloud
+    Includes: Order, Line Items, Shipments, Shipment Lines, Returns, Return Lines
+    """
+    try:
+        # Build the individual order URL with expand parameters for comprehensive data
+        api_path = f"/checkout/orders/{api_version}"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/orders/{order_id}"
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Prepare query parameters with expand to get all related data
+        params = {
+            'siteId': site_id,
+            'expand': 'productItems,payments,paymentInstruments,shipments,notes'  # Request all related data
+        }
+        
+        logging.info(f"Fetching comprehensive order data for {order_id} from: {url}")
+        logging.info(f"Expand parameters: {params['expand']}")
+        
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        
+        if response.status_code == 200:
+            order_data = response.json()
+            
+            # Transform the SFCC order data to match Shopify/BigCommerce structure
+            enhanced_order = transform_sfcc_order_data(order_data, order_id)
+            
+            logging.info(f"Successfully fetched and transformed order {order_id}")
+            logging.info(f"Order contains: {len(enhanced_order.get('lineItems', []))} line items, {len(enhanced_order.get('fulfillments', []))} shipments")
+            
+            return enhanced_order
+        else:
+            logging.warning(f"Failed to fetch individual order {order_id}. Status: {response.status_code}")
+            logging.warning(f"Response: {response.text}")
+            return None
+            
+    except Exception as e:
+        logging.error(f"Error fetching individual order {order_id}: {str(e)}")
+        return None
+
+
+def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
+    """
+    Transform SFCC order data to match Shopify/BigCommerce structure
+    Creates: Orders, Line Items, Shipments, Shipment Lines, Returns, Return Lines
+    """
+    try:
+        # Start with the base order data
+        transformed_order = sfcc_order.copy()
+        
+        # Extract and transform line items (product items)
+        line_items = []
+        product_items = sfcc_order.get('productItems', [])
+        
+        for idx, item in enumerate(product_items):
+            line_item = {
+                'id': item.get('itemId', f"{order_id}_line_{idx}"),
+                'order_id': order_id,
+                'product_id': item.get('productId'),
+                'variant_id': item.get('productId'),  # SFCC uses productId as variant
+                'sku': item.get('productId'),
+                'name': item.get('productName', ''),
+                'quantity': item.get('quantity', 0),
+                'price': item.get('price', 0),
+                'base_price': item.get('basePrice', 0),
+                'price_after_item_discount': item.get('priceAfterItemDiscount', 0),
+                'price_after_order_discount': item.get('priceAfterOrderDiscount', 0),
+                'tax': item.get('tax', 0),
+                'item_text': item.get('itemText', ''),
+                'gift': item.get('gift', False),
+                'gift_message': item.get('giftMessage', ''),
+                'inventory_id': item.get('inventoryId', ''),
+                'bonus_product_line_item': item.get('bonusProductLineItem', False),
+                'bundled_product_line_item': item.get('bundledProductLineItem', False),
+                'option_product_line_item': item.get('optionProductLineItem', False),
+                'product_list_item': item.get('productListItem', False),
+                'shipment_id': item.get('shipmentId', ''),
+                # Add fulfillment status tracking
+                'fulfillment_status': 'unfulfilled',  # Will be updated based on shipments
+                'quantity_fulfilled': 0,
+                'quantity_shipped': 0,
+                'quantity_returned': 0
+            }
+            
+            # Add any custom attributes
+            if 'c_customAttributes' in item:
+                line_item['custom_attributes'] = item['c_customAttributes']
+                
+            line_items.append(line_item)
+        
+        # Extract and transform shipments (fulfillments)
+        fulfillments = []
+        shipments = sfcc_order.get('shipments', [])
+        
+        for shipment in shipments:
+            fulfillment = {
+                'id': shipment.get('shipmentId', ''),
+                'order_id': order_id,
+                'status': shipment.get('status', ''),
+                'tracking_company': shipment.get('trackingNumber', ''),  # SFCC may not separate company
+                'tracking_number': shipment.get('trackingNumber', ''),
+                'tracking_url': shipment.get('trackingUrl', ''),
+                'created_at': shipment.get('creationDate', ''),
+                'updated_at': shipment.get('lastModified', ''),
+                'shipped_at': shipment.get('shippingDate', ''),
+                'delivery_date': shipment.get('deliveryDate', ''),
+                'shipping_method': shipment.get('shippingMethod', {}).get('name', ''),
+                'shipping_cost': shipment.get('shippingTotalPrice', 0),
+                'shipping_tax': shipment.get('shippingTotalTax', 0),
+                'gift': shipment.get('gift', False),
+                'gift_message': shipment.get('giftMessage', ''),
+                # Shipping address
+                'shipping_address': shipment.get('shippingAddress', {}),
+                # Line items in this shipment
+                'line_items': []
+            }
+            
+            # Extract line items for this shipment
+            shipment_items = shipment.get('productItems', [])
+            for item in shipment_items:
+                shipment_line = {
+                    'id': item.get('itemId', ''),
+                    'line_item_id': item.get('itemId', ''),
+                    'product_id': item.get('productId', ''),
+                    'quantity': item.get('quantity', 0),
+                    'price': item.get('price', 0)
+                }
+                fulfillment['line_items'].append(shipment_line)
+                
+                # Update line item fulfillment status
+                for line_item in line_items:
+                    if line_item['id'] == item.get('itemId', ''):
+                        line_item['quantity_shipped'] += item.get('quantity', 0)
+                        line_item['shipment_id'] = shipment.get('shipmentId', '')
+                        if line_item['quantity_shipped'] >= line_item['quantity']:
+                            line_item['fulfillment_status'] = 'fulfilled'
+                        else:
+                            line_item['fulfillment_status'] = 'partial'
+            
+            fulfillments.append(fulfillment)
+        
+        # Extract returns and refunds (if available in SFCC data)
+        returns = []
+        refunds = []
+        
+        # SFCC may include return information in payments or separate return objects
+        payments = sfcc_order.get('payments', [])
+        for payment in payments:
+            if payment.get('paymentMethodId') == 'CREDIT' or payment.get('amount', 0) < 0:
+                # This might be a refund
+                refund = {
+                    'id': payment.get('paymentId', ''),
+                    'order_id': order_id,
+                    'amount': abs(payment.get('amount', 0)),
+                    'currency': payment.get('currencyCode', 'USD'),
+                    'reason': payment.get('paymentMethodId', ''),
+                    'created_at': payment.get('creationDate', ''),
+                    'processed_at': payment.get('creationDate', ''),
+                    'gateway': payment.get('paymentProcessor', ''),
+                    'transaction_id': payment.get('paymentTransactionId', ''),
+                    'note': payment.get('c_note', ''),
+                    'refund_line_items': []  # Would need additional API calls to get line-level returns
+                }
+                refunds.append(refund)
+        
+        # Update the transformed order with structured data
+        transformed_order.update({
+            'lineItems': line_items,
+            'fulfillments': fulfillments,
+            'returns': returns,
+            'refunds': refunds,
+            # Add summary counts
+            'line_items_count': len(line_items),
+            'fulfillments_count': len(fulfillments),
+            'returns_count': len(returns),
+            'refunds_count': len(refunds),
+            # Add processing metadata
+            'data_structure_version': '1.0',
+            'transformed_at': datetime.now().isoformat(),
+            'source_platform': 'salesforce_commerce_cloud'
+        })
+        
+        logging.info(f"Transformed order {order_id}: {len(line_items)} line items, {len(fulfillments)} fulfillments, {len(refunds)} refunds")
+        return transformed_order
+        
+    except Exception as e:
+        logging.error(f"Error transforming SFCC order data for {order_id}: {str(e)}")
+        # Return original data if transformation fails
+        return sfcc_order
+
+
+def transform_sfcc_product_data(sfcc_product: dict) -> dict:
+    """
+    Transform SFCC Commerce API product data to include comprehensive variant and inventory information
+    """
+    try:
+        # Start with the base product data
+        transformed_product = sfcc_product.copy()
+        
+        # Commerce API structure - extract availability data
+        availability_model = sfcc_product.get('availabilityModel', {})
+        inventory_record = availability_model.get('inventoryRecord', {})
+        
+        # Comprehensive inventory information
+        transformed_product['inventory'] = {
+            "orderable": availability_model.get('orderable', False),
+            "in_stock": availability_model.get('inStock', False),
+            "allocation": inventory_record.get('allocation', 0),
+            "preorderable": inventory_record.get('preorderable', False),
+            "backorderable": inventory_record.get('backorderable', False),
+            "stock_level": inventory_record.get('stockLevel', 0),
+            "ats": inventory_record.get('ats', 0),  # Available to Sell
+            "reservations": inventory_record.get('reservations', 0),
+            "turnover": inventory_record.get('turnover', 0),
+            "perpetual": inventory_record.get('perpetual', False),
+            "preorder_backorder_allocation": inventory_record.get('preorderBackorderAllocation', 0),
+            "preorder_backorder_handling": inventory_record.get('preorderBackorderHandling', ''),
+            "in_stock_date": inventory_record.get('inStockDate', ''),
+            "restockable": inventory_record.get('restockable', False)
+        }
+        
+        # Extract and organize pricing data
+        price_model = sfcc_product.get('priceModel', {})
+        price_info = price_model.get('priceInfo', {})
+        price_range = price_model.get('priceRange', {})
+        
+        transformed_product['pricing'] = {
+            "currency": sfcc_product.get('currency', 'USD'),
+            "price": price_model.get('price', 0),
+            "price_book": price_info.get('priceBook'),
+            "price_book_price": price_model.get('priceBookPrice', 0),
+            "min_price": price_range.get('minPrice', 0),
+            "max_price": price_range.get('maxPrice', 0),
+            "price_tiers": price_range.get('priceTiers', []),
+            "tiered_prices": price_model.get('tieredPrices', []),
+            "sale_price": price_model.get('salePrice', 0),
+            "list_price": price_model.get('listPrice', 0)
+        }
+        
+        # Extract comprehensive variant information
+        variation_model = sfcc_product.get('variationModel', {})
+        variants = []
+        
+        if variation_model:
+            # Master product with variants
+            variation_groups = variation_model.get('variationGroups', [])
+            variants_data = variation_model.get('variants', [])
+            
+            for variant in variants_data:
+                variant_info = {
+                    'variant_id': variant.get('productId', ''),
+                    'sku': variant.get('productId', ''),
+                    'orderable': variant.get('orderable', False),
+                    'price': variant.get('price', 0),
+                    'variation_values': variant.get('variationValues', {}),
+                    'inventory': {
+                        'stock_level': variant.get('stockLevel', 0),
+                        'ats': variant.get('ats', 0),
+                        'orderable': variant.get('orderable', False),
+                        'in_stock': variant.get('inStock', False)
+                    }
+                }
+                variants.append(variant_info)
+            
+            # Add variation attributes information
+            transformed_product['variation_attributes'] = variation_model.get('variationAttributes', [])
+            transformed_product['variation_groups'] = variation_groups
+        
+        transformed_product['variants'] = variants
+        transformed_product['is_master'] = len(variants) > 0
+        transformed_product['variant_count'] = len(variants)
+        
+        # Extract promotions
+        promotions = sfcc_product.get('promotions', [])
+        product_promotions = sfcc_product.get('productPromotions', [])
+        
+        transformed_product['promotions'] = {
+            "active_promotions": promotions,
+            "product_promotions": product_promotions,
+            "promotional_price": next((p.get('promotionalPrice') for p in promotions if p.get('promotionalPrice')), None),
+            "callout_message": next((p.get('calloutMsg') for p in promotions if p.get('calloutMsg')), None)
+        }
+        
+        # Extract images
+        image_groups = sfcc_product.get('imageGroups', [])
+        transformed_product['images'] = []
+        for group in image_groups:
+            for image in group.get('images', []):
+                transformed_product['images'].append({
+                    'view_type': group.get('viewType', ''),
+                    'alt': image.get('alt', ''),
+                    'dis_base_link': image.get('disBaseLink', ''),
+                    'link': image.get('link', ''),
+                    'title': image.get('title', '')
+                })
+        
+        # Add comprehensive product metadata
+        transformed_product.update({
+            # Product identifiers - In Commerce API, use id as SKU
+            'sku': sfcc_product.get('id', ''),  # Commerce API id is the SKU
+            'product_id': sfcc_product.get('id', ''),
+            'manufacturer_name': sfcc_product.get('manufacturerName', ''),
+            'manufacturer_sku': sfcc_product.get('manufacturerSku', ''),
+            'upc': sfcc_product.get('upc', ''),
+            'ean': sfcc_product.get('ean', ''),
+            'isbn': sfcc_product.get('isbn', ''),
+            
+            # Product details
+            'brand': sfcc_product.get('brand', ''),
+            
+            # Status flags
+            'online': sfcc_product.get('online', False),
+            'searchable': sfcc_product.get('searchable', False),
+            
+            # Descriptions
+            'short_description': sfcc_product.get('shortDescription', ''),
+            'long_description': sfcc_product.get('longDescription', ''),
+            
+            # Processing metadata
+            'data_structure_version': '1.0',
+            'transformed_at': datetime.now().isoformat(),
+            'source_platform': 'salesforce_commerce_cloud'
+        })
+        
+        logging.info(f"Transformed product {sfcc_product.get('id', 'unknown')}: {len(variants)} variants, inventory ATS: {transformed_product['inventory']['ats']}")
+        return transformed_product
+        
+    except Exception as e:
+        logging.error(f"Error transforming SFCC product data for {sfcc_product.get('id', 'unknown')}: {str(e)}")
+        # Return original data if transformation fails
+        return sfcc_product
 
 
 def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = None) -> bool:
@@ -608,13 +1025,12 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
             'Content-Type': 'application/json'
         }
         
-        # Enhanced product search query with comprehensive fields
+        # Basic product search query
         search_query = {
             "limit": int(page_size),
             "query": {
                 "textQuery": {
                     "fields": [
-                        # Basic queryable fields only
                         "id", "name"
                     ],
                     "searchPhrase": "*"
@@ -684,39 +1100,11 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
                     "reservations": inventory_record.get('reservations', 0),
                     "turnover": inventory_record.get('turnover', 0)
                 }
-                
-                # Temporarily disabled pricing and promotion processing
-                # # Extract and organize pricing data
-                # price_model = product.get('priceModel', {})
-                # price_info = price_model.get('priceInfo', {})
-                # price_range = price_model.get('priceRange', {})
-                
-                # product['pricing'] = {
-                #     "currency": product.get('currency', 'USD'),
-                #     "price": price_model.get('price', 0),
-                #     "price_book": price_info.get('priceBook'),
-                #     "price_book_price": price_model.get('priceBookPrice', 0),
-                #     "min_price": price_range.get('minPrice', 0),
-                #     "max_price": price_range.get('maxPrice', 0),
-                #     "price_tiers": price_range.get('priceTiers', []),
-                #     "tiered_prices": price_model.get('tieredPrices', [])
-                # }
-                
-                # # Extract promotions
-                # promotions = product.get('promotions', [])
-                # product_promotions = product.get('productPromotions', [])
-                
-                # product['promotions'] = {
-                #     "active_promotions": promotions,
-                #     "product_promotions": product_promotions,
-                #     "promotional_price": next((p.get('promotionalPrice') for p in promotions if p.get('promotionalPrice')), None),
-                #     "callout_message": next((p.get('calloutMsg') for p in promotions if p.get('calloutMsg')), None)
-                # }
             
             all_products.extend(products)
             logging.info(f"Retrieved {len(products)} products, total: {len(all_products)}")
             
-            # Check if we have more pages
+            # Check if we have more pages using Commerce API pagination
             total = data.get('total', 0)
             if offset + len(products) >= total:
                 logging.info(f"Reached end of results: {offset + len(products)} >= {total}")
