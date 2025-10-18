@@ -129,6 +129,46 @@ https://bigcommerce-downloader.azurewebsites.net/api/get_product_data?code={func
 - ❌ **No file created**: When API errors occur
 - ❌ **No file created**: When zero records found
 
+## Function 2: `get_order_data`
+
+Downloads order-related data from the BigCommerce v2 REST API.
+
+### Item Parameter
+
+This function uses an `item` parameter to specify which data to download. Supported values are:
+- **`Orders`**: Fetches all orders. (Endpoint: `/v2/orders`)
+- **`OrderLine`**: Fetches all product line items across all orders. (Endpoint: `/v2/orders/products`)
+- **`Fulfillments`**: Fetches all fulfillments (shipments). (Endpoint: `/v2/orders/shipments`)
+- **`FulfillmentLines`**: Fetches all line items within each fulfillment.
+
+### Required Parameters
+
+- **`auth_token`**: BigCommerce API token.
+- **`base_url`**: BigCommerce store hash (e.g., `lb2chb77ok`).
+- **`datalake_key`**: Azure Data Lake Storage access key.
+
+### Optional Parameters
+
+- **`item`**: The type of order data to download (default: `Orders`).
+- **`data_lake_path`**: Azure Data Lake path (default: `Retail/BigCommerce`).
+- **`filename`**: Filename prefix (default: `bigcommerce`). The final filename will be `{filename}-{item}.json`.
+- **`min_date_created`**: The minimum creation date for orders (format: `rfc2822` or `iso8601`).
+- **`max_date_created`**: The maximum creation date for orders.
+
+### Example Usage
+
+#### Get All Orders Created After a Specific Date
+
+```
+https://bigcommerce-downloader.azurewebsites.net/api/get_order_data?code=YOUR_KEY&auth_token=YOUR_TOKEN&base_url=lb2chb77ok&datalake_key=YOUR_LAKE_KEY&item=Orders&min_date_created=2024-01-01T00:00:00Z
+```
+
+#### Get All Order Line Items
+
+```
+https://bigcommerce-downloader.azurewebsites.net/api/get_order_data?code=YOUR_KEY&auth_token=YOUR_TOKEN&base_url=lb2chb77ok&datalake_key=YOUR_LAKE_KEY&item=OrderLine
+```
+
 ## Deployment
 
 1. **Create Function App**:

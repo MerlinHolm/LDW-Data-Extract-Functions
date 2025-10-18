@@ -367,6 +367,88 @@ The function provides detailed logging for:
 - Data Lake save operations
 - Error stack traces
 
+# Shopify Order Data Downloader
+
+This function downloads order data from Shopify using the Admin GraphQL API. It can filter orders by date ranges or search for a specific order by its number.
+
+## Function Details
+
+- **Function Name**: `get_order_data`
+- **Authentication**: Function Key Required
+
+## Parameters
+
+### Required Parameters
+
+- **`auth_token`**: Shopify Admin API access token.
+- **`base_url`**: Shopify store domain (e.g., `dearfoams-costco-next`).
+- **`datalake_key`**: Azure Data Lake Storage access key.
+
+### Optional Parameters
+
+- **`api_version`**: Shopify API version (default: `2024-10`).
+- **`data_lake_path`**: Azure Data Lake path (default: `Retail/Shopify/Orders`).
+- **`page_size`**: Number of orders per GraphQL query (default: `100`).
+- **`order_number`**: Search for a specific order by its number (e.g., `1004`).
+- **`created_at_min`**: ISO 8601 date for the minimum creation date (e.g., `2024-01-01T00:00:00Z`).
+- **`created_at_max`**: ISO 8601 date for the maximum creation date.
+- **`updated_at_min`**: ISO 8601 date for the minimum update date.
+- **`updated_at_max`**: ISO 8601 date for the maximum update date.
+
+## GraphQL Query
+
+The function uses a comprehensive GraphQL query to retrieve order details, including line items, fulfillments, refunds, and customer information.
+
+## Azure Data Lake Integration
+
+- **Account**: `prodbimanager`
+- **File System**: `prodbidlstorage`
+- **Default Path**: `Retail/Shopify/Orders`
+- **Filename Format**: Each order is saved as a separate JSON file, named after the order's `name` (e.g., `1004.json`).
+
+## Response Format
+
+### Success Response
+
+```json
+{
+  "status": "success",
+  "message": "Processed 15 orders.",
+  "records_saved": 15,
+  "records_failed": 0,
+  "saved_files": [
+    "1001.json",
+    "1002.json"
+  ],
+  "failed_files": [],
+  "path": "Retail/Shopify/Orders"
+}
+```
+
+### No Orders Found
+
+```json
+{
+    "status": "success",
+    "message": "No new orders found.",
+    "records_count": 0
+}
+```
+
+## Example Usage
+
+### Get Orders by Date Range
+
+```
+https://shopify-downloader.azurewebsites.net/api/get_order_data?code=YOUR_KEY&auth_token=YOUR_TOKEN&base_url=your-store&datalake_key=YOUR_LAKE_KEY&created_at_min=2024-05-01T00:00:00Z
+```
+
+### Get a Specific Order by Number
+
+```
+https://shopify-downloader.azurewebsites.net/api/get_order_data?code=YOUR_KEY&auth_token=YOUR_TOKEN&base_url=your-store&datalake_key=YOUR_LAKE_KEY&order_number=1004
+```
+
 ## Version History
 
 - **v1.0**: Initial release with comprehensive Shopify GraphQL product data download

@@ -564,10 +564,12 @@ def fetch_shopify_orders(auth_token: str, graphql_url: str, page_size: str, orde
                                 id
                                 title
                                 quantity
+                                name
                                 sku
                                 variantTitle
                                 vendor
                                 fulfillableQuantity
+                                fulfillmentStatus
                                 taxable
                                 requiresShipping
                                 variant {{ id title price inventoryPolicy product {{ id title vendor productType }} }}
@@ -585,7 +587,9 @@ def fetch_shopify_orders(auth_token: str, graphql_url: str, page_size: str, orde
                         status
                         createdAt
                         updatedAt
+                        displayStatus
                         legacyResourceId
+                        totalQuantity
                         trackingInfo(first: 50) {{
                             company
                             number
@@ -596,6 +600,7 @@ def fetch_shopify_orders(auth_token: str, graphql_url: str, page_size: str, orde
                                 node {{
                                     lineItem {{ id title quantity sku vendor variantTitle originalUnitPriceSet {{ shopMoney {{ amount currencyCode }} }} }}
                                     quantity
+                                    
                                 }}
                             }}
                         }}
@@ -751,9 +756,15 @@ def _transform_order(order):
     if not order:
         return None
 
-    # Flatten lineItems
+    # Flatten lineItems and process new fields
     if 'lineItems' in order and order['lineItems']:
-        order['lineItems'] = _flatten_connection(order['lineItems'])
+        line_items = _flatten_connection(order['lineItems'])
+        for item in line_items:
+            # Combine 'name' and 'title' for a comprehensive line item name
+            item['line_item_name'] = item.get('name', item.get('title', ''))
+            # Capture the fulfillment status for the line item
+            item['line_item_fulfillment_status'] = item.get('fulfillmentStatus')
+        order['lineItems'] = line_items
 
     # Flatten fulfillments and their nested items
     if 'fulfillments' in order and order['fulfillments']:
@@ -768,3 +779,274 @@ def _transform_order(order):
                 refund['refundLineItems'] = _flatten_connection(refund['refundLineItems'])
 
     return order
+
+
+@app.route(route="get_status_data")
+def get_status_data(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info('Shopify status data download function processed a request.')
+
+    try:
+        # Get parameters from request
+        auth_token = req.params.get('auth_token')
+        base_url = req.params.get('base_url')
+        api_version = req.params.get('api_version', '2024-10')
+        datalake_key = req.params.get('datalake_key')
+        data_lake_path = req.params.get('data_lake_path', 'Retail/Shopify/OrderStatus')
+        page_size = req.params.get('page_size', '100')
+        order_number_raw = req.params.get('order_number')
+        order_number = None
+        if order_number_raw:
+            numeric_order_number = re.sub(r'\D', '', order_number_raw)
+            if numeric_order_number:
+                order_number = numeric_order_number
+            else:
+                return func.HttpResponse(
+                    json.dumps({"status": "error", "message": "Invalid order_number parameter: must contain digits."}),
+                    status_code=400, mimetype="application/json"
+                )
+
+        created_at_min = req.params.get('created_at_min')
+        created_at_max = req.params.get('created_at_max')
+        updated_at_min = req.params.get('updated_at_min')
+        updated_at_max = req.params.get('updated_at_max')
+
+        if not all([auth_token, base_url, datalake_key]):
+            return func.HttpResponse(
+                json.dumps({"error": "MISSING_PARAMETER", "message": "auth_token, base_url, and datalake_key are required"}),
+                status_code=400, mimetype="application/json"
+            )
+
+        full_base_url = f"https://{base_url}.myshopify.com/admin/api/{api_version}/graphql.json"
+        logging.info(f"Fetching Shopify order status data from: {full_base_url}")
+
+        status_data = fetch_shopify_statuses(auth_token, full_base_url, page_size, order_number, created_at_min, created_at_max, updated_at_min, updated_at_max)
+
+        if 'error' in status_data:
+            return func.HttpResponse(json.dumps(status_data), status_code=500, mimetype="application/json")
+
+        orders = status_data.get('data', [])
+        if not orders:
+            # Include debugging information in the response when no orders found
+            debug_info = {
+                "status": "success", 
+                "message": "No new order statuses found.", 
+                "records_count": 0,
+                "debug_info": {
+                    "created_at_min": created_at_min,
+                    "created_at_max": created_at_max,
+                    "updated_at_min": updated_at_min,
+                    "updated_at_max": updated_at_max,
+                    "order_number": order_number,
+                    "query_filter_used": status_data.get('query_filter_used', 'Not available'),
+                    "total_pages_checked": status_data.get('total_pages_checked', 'Not available')
+                }
+            }
+            return func.HttpResponse(json.dumps(debug_info), status_code=200, mimetype="application/json")
+
+        saved_files = []
+        failed_files = []
+        for raw_order in orders:
+            order = _transform_order(raw_order)
+            if not order:
+                logging.warning("Skipping an order that failed transformation.")
+                continue
+
+            order_name = order.get('name')
+            if order_name:
+                cleaned_name = re.sub(r'[^a-zA-Z0-9-]', '', order_name)
+                filename = cleaned_name.lstrip('-')
+                
+                if filename:
+                    if save_order_to_datalake(order, datalake_key, data_lake_path, filename):
+                        saved_files.append(f"{filename}.json")
+                    else:
+                        failed_files.append(f"{filename}.json")
+                else:
+                    fallback_id = order.get('legacyResourceId', order.get('id', 'unknown_id'))
+                    logging.warning(f"Could not generate a valid filename from order name: '{order_name}'. Fallback ID: {fallback_id}")
+                    failed_files.append(f"FAILED_INVALID_NAME(id_{fallback_id})")
+            else:
+                fallback_id = order.get('legacyResourceId', order.get('id', 'unknown_id'))
+                logging.warning(f"Order is missing 'name' field. Cannot save file. Fallback ID: {fallback_id}")
+                failed_files.append(f"FAILED_NO_NAME(id_{fallback_id})")
+
+        response_data = {
+            "status": "partial_success" if failed_files else "success",
+            "message": f"Processed {len(orders)} order statuses.",
+            "records_saved": len(saved_files),
+            "records_failed": len(failed_files),
+            "failed_files": failed_files,
+            "path": data_lake_path
+        }
+        
+        return func.HttpResponse(json.dumps(response_data), status_code=200, mimetype="application/json")
+
+    except Exception as e:
+        logging.error(f"Unexpected error in get_status_data: {str(e)}")
+        import traceback
+        return func.HttpResponse(
+            json.dumps({"error": "UNEXPECTED_ERROR", "message": str(e), "traceback": traceback.format_exc()}),
+            status_code=500, mimetype="application/json"
+        )
+
+def fetch_shopify_statuses(auth_token: str, graphql_url: str, page_size: str, order_number: str = None, created_at_min: str = None, created_at_max: str = None, updated_at_min: str = None, updated_at_max: str = None) -> dict:
+    headers = {'X-Shopify-Access-Token': auth_token, 'Content-Type': 'application/json'}
+    
+    if order_number:
+        query_filter = f"name:*{order_number}*"
+    else:
+        filters = []
+        if created_at_min:
+            filters.append(f"created_at:>='{created_at_min}'")
+        if created_at_max:
+            filters.append(f"created_at:<='{created_at_max}'")
+        if updated_at_min:
+            filters.append(f"updated_at:>='{updated_at_min}'")
+        if updated_at_max:
+            filters.append(f"updated_at:<='{updated_at_max}'")
+        query_filter = " AND ".join(filters)
+
+    # ==> ADDED FOR DEBUGGING <==
+    logging.info(f"Constructed Shopify Query Filter: '{query_filter}'")
+    # ============================
+
+    query_template = """query($cursor: String, $query: String) {{
+        orders(first: {page_size}, after: $cursor, query: $query, sortKey: UPDATED_AT, reverse: true) {{
+            edges {{
+                node {{
+                    id
+                    legacyResourceId
+                    name
+                    displayFinancialStatus
+                    displayFulfillmentStatus
+                    updatedAt
+                    fulfillments(first: 10) {{
+                        id
+                        status
+                        displayStatus
+                        createdAt
+                        updatedAt
+                        legacyResourceId
+                        trackingInfo(first: 10) {{
+                            company
+                            number
+                            url
+                        }}
+                    }}
+                }}
+            }}
+            pageInfo {{
+                hasNextPage
+                endCursor
+            }}
+        }}
+    }}"""
+
+    all_orders = []
+    cursor = None
+    page_count = 0
+    max_pages = 100
+
+    while page_count < max_pages:
+        page_count += 1
+        variables = {"cursor": cursor, "query": query_filter if query_filter else None}
+        graphql_query = {"query": query_template.format(page_size=page_size), "variables": variables}
+
+        # ==> ADDED FOR DEBUGGING <==
+        logging.info(f"Executing GraphQL Query (Page {page_count}): {json.dumps(graphql_query, indent=2)}")
+        # ===========================
+    else:
+        filters = []
+        if created_at_min:
+            filters.append(f"created_at:>='{created_at_min}'")
+        if created_at_max:
+            filters.append(f"created_at:<='{created_at_max}'")
+        if updated_at_min:
+            filters.append(f"updated_at:>='{updated_at_min}'")
+        if updated_at_max:
+            filters.append(f"updated_at:<='{updated_at_max}'")
+        query_filter = " AND ".join(filters)
+    logging.info(f"Using query filter for statuses: {query_filter}")
+
+    query_template = """query($cursor: String, $query: String) {{
+        orders(first: {page_size}, after: $cursor, query: $query) {{
+            edges {{
+                node {{
+                    id
+                    name
+                    displayFinancialStatus
+                    displayFulfillmentStatus
+                    lineItems(first: 100) {{
+                        edges {{
+                            node {{
+                                id
+                                name
+                                fulfillmentStatus
+                            }}
+                        }}
+                    }}
+                    fulfillments(first: 100) {{
+                        id
+                        name
+                        displayStatus
+                        status
+                        fulfillmentLineItems(first: 100) {{
+                            edges {{
+                                node {{
+                                    id
+                                    originalTotal
+                                    lineItem {{ id }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+            pageInfo {{
+                hasNextPage
+                endCursor
+            }}
+        }}
+    }}"""
+
+    all_orders = []
+    cursor = None
+    page_count = 0
+    max_pages = 100
+
+    while page_count < max_pages:
+        page_count += 1
+        variables = {"cursor": cursor, "query": query_filter if query_filter else None}
+        graphql_query = {"query": query_template.format(page_size=page_size), "variables": variables}
+        
+        try:
+            response = requests.post(graphql_url, headers=headers, json=graphql_query, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+
+            if 'errors' in data:
+                logging.error(f"GraphQL errors: {data['errors']}")
+                return {"error": "GRAPHQL_QUERY_ERROR", "details": data['errors']}
+
+            orders_data = data.get('data', {}).get('orders', {})
+            page_info = orders_data.get('pageInfo', {})
+
+            for edge in orders_data.get('edges', []):
+                all_orders.append(edge['node'])
+
+            logging.info(f"Page {page_count}: Fetched {len(orders_data.get('edges', []))} order statuses. Total so far: {len(all_orders)}")
+
+            if not page_info.get('hasNextPage'):
+                break
+            cursor = page_info.get('endCursor')
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error fetching Shopify order statuses: {e}")
+            return {"error": "FETCH_ERROR", "message": str(e)}
+
+    return {
+        "data": all_orders, 
+        "total_count": len(all_orders),
+        "query_filter_used": query_filter,
+        "total_pages_checked": page_count
+    }
