@@ -324,6 +324,13 @@ def get_file_data(req: func.HttpRequest) -> func.HttpResponse:
         try:
             base_url = req_body.get('base_url', 'https://api.monday.com')
             api_version = req_body.get('api_version', 'v2')
+            api_url = f"{base_url}/{api_version}"
+            
+            # Headers for Monday.com API
+            headers = {
+                "Authorization": api_token,
+                "Content-Type": "application/json"
+            }
             
             # Fetch all items with pagination for file downloads
             all_items = []

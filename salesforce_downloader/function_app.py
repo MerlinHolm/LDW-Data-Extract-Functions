@@ -483,8 +483,36 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
 
         # Add date filters if provided (keeping original parameter names for compatibility)
         if start_date and end_date:
-            params['creationDateFrom'] = start_date
-            params['creationDateTo'] = end_date
+            # SFCC might need full datetime format, try both formats
+            if 'T' not in start_date:
+                # Add time component if not present
+                start_date_formatted = f"{start_date}T00:00:00.000Z"
+                end_date_formatted = f"{end_date}T23:59:59.999Z"
+            else:
+                start_date_formatted = start_date
+                end_date_formatted = end_date
+                
+            params['creationDateFrom'] = start_date_formatted
+            params['creationDateTo'] = end_date_formatted
+            
+            logging.info(f"Date filtering: Original start={start_date}, end={end_date}")
+            logging.info(f"Date filtering: Formatted start={start_date_formatted}, end={end_date_formatted}")
+        elif start_date:
+            # If only start_date provided, add time component
+            if 'T' not in start_date:
+                start_date_formatted = f"{start_date}T00:00:00.000Z"
+            else:
+                start_date_formatted = start_date
+            params['creationDateFrom'] = start_date_formatted
+            logging.info(f"Date filtering: Start date only - {start_date_formatted}")
+        elif end_date:
+            # If only end_date provided, add time component
+            if 'T' not in end_date:
+                end_date_formatted = f"{end_date}T23:59:59.999Z"
+            else:
+                end_date_formatted = end_date
+            params['creationDateTo'] = end_date_formatted
+            logging.info(f"Date filtering: End date only - {end_date_formatted}")
         
         logging.info(f"Fetching orders from Salesforce Commerce Cloud: {url}")
         logging.info(f"API Headers: {headers}")
@@ -526,6 +554,16 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
                 
                 if not orders:
                     logging.info("No orders found in response, breaking pagination loop")
+                    
+                    # If this is the first page and we're using date filters, log debug info
+                    if page_count == 1 and (start_date or end_date):
+                        logging.warning(f"No orders found with date filters. Date range: {params.get('creationDateFrom', 'None')} to {params.get('creationDateTo', 'None')}")
+                        logging.warning("Consider:")
+                        logging.warning("1. Checking if the order creation date is within the specified range")
+                        logging.warning("2. Trying a broader date range")
+                        logging.warning("3. Checking if the order exists without date filters")
+                        logging.warning("4. Verifying the time zone - SFCC might use UTC")
+                    
                     break
                 
                 # Enhance each order with individual order details if needed
@@ -537,6 +575,10 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
                         if order_id:
                             detailed_order = fetch_individual_order(access_token, base_url, api_version, organization_id, site_id, order_id)
                             if detailed_order:
+                                # Also try to fetch shipments separately if not included
+                                shipments = fetch_order_shipments(access_token, base_url, api_version, organization_id, site_id, order_id)
+                                if shipments:
+                                    detailed_order['additional_shipments'] = shipments
                                 enhanced_orders.append(detailed_order)
                             else:
                                 enhanced_orders.append(order)  # Use original if detailed fetch fails
@@ -632,9 +674,10 @@ def fetch_individual_order(access_token: str, base_url: str, api_version: str, o
         }
         
         # Prepare query parameters with expand to get all related data
+        # Try different expand combinations to ensure we get all line items
         params = {
             'siteId': site_id,
-            'expand': 'productItems,payments,paymentInstruments,shipments,notes'  # Request all related data
+            'expand': 'productItems,payments,paymentInstruments,shipments,notes,productLineItems'  # Request all related data including alternative line item names
         }
         
         logging.info(f"Fetching comprehensive order data for {order_id} from: {url}")
@@ -644,6 +687,16 @@ def fetch_individual_order(access_token: str, base_url: str, api_version: str, o
         
         if response.status_code == 200:
             order_data = response.json()
+            
+            # Debug logging to understand the API response structure
+            logging.info(f"Raw order data keys for {order_id}: {list(order_data.keys()) if isinstance(order_data, dict) else 'Not a dict'}")
+            if isinstance(order_data, dict):
+                product_items = order_data.get('productItems', [])
+                logging.info(f"Raw productItems count for {order_id}: {len(product_items)}")
+                if product_items:
+                    logging.info(f"First productItem keys: {list(product_items[0].keys()) if product_items else 'No items'}")
+                else:
+                    logging.warning(f"No productItems found in order {order_id}. Available keys: {list(order_data.keys())}")
             
             # Transform the SFCC order data to match Shopify/BigCommerce structure
             enhanced_order = transform_sfcc_order_data(order_data, order_id)
@@ -662,6 +715,53 @@ def fetch_individual_order(access_token: str, base_url: str, api_version: str, o
         return None
 
 
+def fetch_order_shipments(access_token: str, base_url: str, api_version: str, organization_id: str, site_id: str, order_id: str) -> list:
+    """
+    Fetch shipments for a specific order from Salesforce Commerce Cloud
+    This is a separate API call in case shipments are not included in the order expand
+    """
+    try:
+        # Build the shipments URL for this order
+        api_path = f"/checkout/orders/{api_version}"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/orders/{order_id}/shipments"
+        
+        # Prepare headers
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        # Prepare query parameters
+        params = {
+            'siteId': site_id,
+            'expand': 'productItems,productLineItems,lineItems,items'  # Request all line item variations
+        }
+        
+        logging.info(f"Fetching shipments for order {order_id} from: {url}")
+        
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        
+        if response.status_code == 200:
+            shipments_data = response.json()
+            
+            # Handle different response structures
+            shipments = []
+            if isinstance(shipments_data, dict):
+                shipments = shipments_data.get('data', shipments_data.get('shipments', shipments_data.get('hits', [])))
+            elif isinstance(shipments_data, list):
+                shipments = shipments_data
+            
+            logging.info(f"Successfully fetched {len(shipments)} shipments for order {order_id}")
+            return shipments
+        else:
+            logging.info(f"No separate shipments endpoint available for order {order_id}. Status: {response.status_code}")
+            return []
+            
+    except Exception as e:
+        logging.warning(f"Error fetching shipments for order {order_id}: {str(e)}")
+        return []
+
+
 def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
     """
     Transform SFCC order data to match Shopify/BigCommerce structure
@@ -673,7 +773,21 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
         
         # Extract and transform line items (product items)
         line_items = []
+        
+        # Try different possible field names for line items in SFCC
         product_items = sfcc_order.get('productItems', [])
+        if not product_items:
+            product_items = sfcc_order.get('productLineItems', [])
+        if not product_items:
+            product_items = sfcc_order.get('lineItems', [])
+        if not product_items:
+            product_items = sfcc_order.get('items', [])
+        
+        logging.info(f"Transform function - Order {order_id}: Found {len(product_items)} line items in raw data")
+        if product_items:
+            logging.info(f"Transform function - First line item structure: {list(product_items[0].keys())}")
+        else:
+            logging.warning(f"Transform function - No line items found for order {order_id}. Available top-level keys: {list(sfcc_order.keys())}")
         
         for idx, item in enumerate(product_items):
             line_item = {
@@ -713,7 +827,19 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
         
         # Extract and transform shipments (fulfillments)
         fulfillments = []
+        
+        # Try different possible field names for shipments in SFCC
         shipments = sfcc_order.get('shipments', [])
+        if not shipments:
+            shipments = sfcc_order.get('fulfillments', [])
+        if not shipments:
+            shipments = sfcc_order.get('deliveries', [])
+        
+        logging.info(f"Transform function - Order {order_id}: Found {len(shipments)} shipments in raw data")
+        if shipments:
+            logging.info(f"Transform function - First shipment structure: {list(shipments[0].keys())}")
+        else:
+            logging.warning(f"Transform function - No shipments found for order {order_id}")
         
         for shipment in shipments:
             fulfillment = {
@@ -739,7 +865,19 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
             }
             
             # Extract line items for this shipment
+            # Try different possible field names for shipment line items
             shipment_items = shipment.get('productItems', [])
+            if not shipment_items:
+                shipment_items = shipment.get('productLineItems', [])
+            if not shipment_items:
+                shipment_items = shipment.get('lineItems', [])
+            if not shipment_items:
+                shipment_items = shipment.get('items', [])
+            
+            logging.info(f"Transform function - Shipment {shipment.get('shipmentId', 'unknown')}: Found {len(shipment_items)} line items")
+            if shipment_items:
+                logging.info(f"Transform function - First shipment line item structure: {list(shipment_items[0].keys())}")
+            
             for item in shipment_items:
                 shipment_line = {
                     'id': item.get('itemId', ''),
@@ -761,6 +899,66 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
                             line_item['fulfillment_status'] = 'partial'
             
             fulfillments.append(fulfillment)
+        
+        # Process additional shipments if they were fetched separately
+        if 'additional_shipments' in sfcc_order:
+            additional_shipments = sfcc_order['additional_shipments']
+            logging.info(f"Transform function - Order {order_id}: Processing {len(additional_shipments)} additional shipments")
+            
+            for shipment in additional_shipments:
+                fulfillment = {
+                    'id': shipment.get('shipmentId', ''),
+                    'order_id': order_id,
+                    'status': shipment.get('status', ''),
+                    'tracking_company': shipment.get('trackingNumber', ''),
+                    'tracking_number': shipment.get('trackingNumber', ''),
+                    'tracking_url': shipment.get('trackingUrl', ''),
+                    'created_at': shipment.get('creationDate', ''),
+                    'updated_at': shipment.get('lastModified', ''),
+                    'shipped_at': shipment.get('shippingDate', ''),
+                    'delivery_date': shipment.get('deliveryDate', ''),
+                    'shipping_method': shipment.get('shippingMethod', {}).get('name', ''),
+                    'shipping_cost': shipment.get('shippingTotalPrice', 0),
+                    'shipping_tax': shipment.get('shippingTotalTax', 0),
+                    'gift': shipment.get('gift', False),
+                    'gift_message': shipment.get('giftMessage', ''),
+                    'shipping_address': shipment.get('shippingAddress', {}),
+                    'line_items': [],
+                    'source': 'additional_api_call'
+                }
+                
+                # Extract line items for this additional shipment
+                shipment_items = shipment.get('productItems', [])
+                if not shipment_items:
+                    shipment_items = shipment.get('productLineItems', [])
+                if not shipment_items:
+                    shipment_items = shipment.get('lineItems', [])
+                if not shipment_items:
+                    shipment_items = shipment.get('items', [])
+                
+                logging.info(f"Transform function - Additional Shipment {shipment.get('shipmentId', 'unknown')}: Found {len(shipment_items)} line items")
+                
+                for item in shipment_items:
+                    shipment_line = {
+                        'id': item.get('itemId', ''),
+                        'line_item_id': item.get('itemId', ''),
+                        'product_id': item.get('productId', ''),
+                        'quantity': item.get('quantity', 0),
+                        'price': item.get('price', 0)
+                    }
+                    fulfillment['line_items'].append(shipment_line)
+                    
+                    # Update line item fulfillment status
+                    for line_item in line_items:
+                        if line_item['id'] == item.get('itemId', ''):
+                            line_item['quantity_shipped'] += item.get('quantity', 0)
+                            line_item['shipment_id'] = shipment.get('shipmentId', '')
+                            if line_item['quantity_shipped'] >= line_item['quantity']:
+                                line_item['fulfillment_status'] = 'fulfilled'
+                            else:
+                                line_item['fulfillment_status'] = 'partial'
+                
+                fulfillments.append(fulfillment)
         
         # Extract returns and refunds (if available in SFCC data)
         returns = []
