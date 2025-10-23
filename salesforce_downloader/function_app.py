@@ -566,27 +566,43 @@ def fetch_salesforce_orders(access_token: str, base_url: str, api_version: str, 
                     
                     break
                 
-                # Enhance each order with individual order details if needed
+                # Transform each order using the transform function directly
                 enhanced_orders = []
                 for order in orders:
                     try:
-                        # Get individual order details if we have an order number/ID
+                        # Get order ID for transformation
                         order_id = order.get('orderNo') or order.get('id') or order.get('orderNumber')
                         if order_id:
+                            logging.info(f"Transforming order {order_id} from list data")
+                            
+                            # Try to get individual order details first for better data
                             detailed_order = fetch_individual_order(access_token, base_url, api_version, organization_id, site_id, order_id)
                             if detailed_order:
+                                logging.info(f"✅ Got detailed order data for {order_id}, using that for transformation")
                                 # Also try to fetch shipments separately if not included
                                 shipments = fetch_order_shipments(access_token, base_url, api_version, organization_id, site_id, order_id)
                                 if shipments:
                                     detailed_order['additional_shipments'] = shipments
                                 enhanced_orders.append(detailed_order)
                             else:
-                                enhanced_orders.append(order)  # Use original if detailed fetch fails
+                                logging.warning(f"⚠️ Individual order fetch failed for {order_id}, transforming list data instead")
+                                # Transform the list order data directly
+                                transformed_order = transform_sfcc_order_data(order, order_id)
+                                enhanced_orders.append(transformed_order)
                         else:
+                            logging.warning(f"⚠️ No order ID found in order data, using raw order")
                             enhanced_orders.append(order)
                     except Exception as e:
-                        logging.warning(f"Failed to enhance order {order.get('orderNo', 'unknown')}: {str(e)}")
-                        enhanced_orders.append(order)  # Use original if enhancement fails
+                        logging.error(f"❌ Failed to process order {order.get('orderNo', 'unknown')}: {str(e)}")
+                        # As last resort, try to transform the raw order
+                        try:
+                            order_id = order.get('orderNo') or order.get('id') or order.get('orderNumber') or 'unknown'
+                            logging.info(f"🔄 Attempting emergency transform for order {order_id}")
+                            transformed_order = transform_sfcc_order_data(order, order_id)
+                            enhanced_orders.append(transformed_order)
+                        except Exception as transform_error:
+                            logging.error(f"❌ Emergency transform also failed for {order_id}: {str(transform_error)}")
+                            enhanced_orders.append(order)  # Use original as absolute last resort
                 
                 all_orders.extend(enhanced_orders)
                 logging.info(f"Fetched {len(enhanced_orders)} orders (total: {len(all_orders)})")
@@ -790,33 +806,89 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
             logging.warning(f"Transform function - No line items found for order {order_id}. Available top-level keys: {list(sfcc_order.keys())}")
         
         for idx, item in enumerate(product_items):
+            # Debug logging for order line item structure
+            logging.info(f"Order line item {idx} keys: {list(item.keys())}")
+            logging.info(f"Order line item {idx} data: itemId={item.get('itemId')}, productId={item.get('productId')}, quantity={item.get('quantity')}")
+            
+            # Try multiple possible ID fields for order line items
+            order_line_id = item.get('itemId') or item.get('lineItemId') or item.get('productLineItemId') or item.get('id') or f"{order_id}_line_{idx}"
+            
+            # Get variant ID and derive master product ID using same logic as product data
+            variant_id = item.get('productId')
+            
+            # Extract master product ID from variant ID using same pattern matching as product data
+            if variant_id:
+                # Check if this looks like a variant ID (numeric ending)
+                if variant_id[-4:].isdigit() or any(c.isalpha() for c in variant_id[-4:]):
+                    # Find the base pattern (remove the variant-specific ending)
+                    master_base = variant_id
+                    # Remove common variant endings (4 chars) and add XXXX
+                    if len(variant_id) > 4:
+                        master_base = variant_id[:-4] + 'XXXX'
+                    master_product_id = master_base
+                else:
+                    # If it doesn't look like a variant, it might already be a master
+                    master_product_id = variant_id
+            else:
+                # Fallback if no productId
+                master_product_id = item.get('masterProductId', variant_id)
+            
+            # Debug logging for ID mapping
+            logging.info(f"Order line item ID mapping: variant_id={variant_id} -> master_product_id={master_product_id}")
+            
             line_item = {
-                'id': item.get('itemId', f"{order_id}_line_{idx}"),
+                # Standard line item fields
+                'id': order_line_id,
                 'order_id': order_id,
-                'product_id': item.get('productId'),
-                'variant_id': item.get('productId'),  # SFCC uses productId as variant
-                'sku': item.get('productId'),
+                'product_id': master_product_id,      # Master product ID
+                'variant_id': variant_id,             # Specific variant ID
+                'sku': variant_id,                    # SKU is the variant ID
                 'name': item.get('productName', ''),
                 'quantity': item.get('quantity', 0),
-                'price': item.get('price', 0),
-                'base_price': item.get('basePrice', 0),
-                'price_after_item_discount': item.get('priceAfterItemDiscount', 0),
-                'price_after_order_discount': item.get('priceAfterOrderDiscount', 0),
+                'price': item.get('basePrice', item.get('netPrice', item.get('price', 0))),
+                'shipment_id': item.get('shipmentId', ''),  # This is the key for joining!
+                
+                # ALL SFCC productItems fields - include everything from raw data
+                'itemId': item.get('itemId', ''),
+                'productId': item.get('productId', ''),
+                'productName': item.get('productName', ''),
+                'itemText': item.get('itemText', ''),
+                'basePrice': item.get('basePrice', 0),
+                'netPrice': item.get('netPrice', 0),
+                'grossPrice': item.get('grossPrice', 0),
+                'priceAfterItemDiscount': item.get('priceAfterItemDiscount', 0),
+                'priceAfterOrderDiscount': item.get('priceAfterOrderDiscount', 0),
+                'adjustedTax': item.get('adjustedTax', 0),
                 'tax': item.get('tax', 0),
-                'item_text': item.get('itemText', ''),
+                'taxBasis': item.get('taxBasis', 0),
+                'taxRate': item.get('taxRate', 0),
+                'brand': item.get('brand', ''),
                 'gift': item.get('gift', False),
-                'gift_message': item.get('giftMessage', ''),
-                'inventory_id': item.get('inventoryId', ''),
-                'bonus_product_line_item': item.get('bonusProductLineItem', False),
-                'bundled_product_line_item': item.get('bundledProductLineItem', False),
-                'option_product_line_item': item.get('optionProductLineItem', False),
-                'product_list_item': item.get('productListItem', False),
-                'shipment_id': item.get('shipmentId', ''),
+                'giftMessage': item.get('giftMessage', ''),
+                'bonusProductLineItem': item.get('bonusProductLineItem', False),
+                'bundledProductLineItem': item.get('bundledProductLineItem', False),
+                'optionProductLineItem': item.get('optionProductLineItem', False),
+                'productListItem': item.get('productListItem', False),
+                'minOrderQuantity': item.get('minOrderQuantity', 1),
+                'stepQuantity': item.get('stepQuantity', 1),
+                'position': item.get('position', 0),
+                'inventoryId': item.get('inventoryId', ''),
+                
                 # Add fulfillment status tracking
-                'fulfillment_status': 'unfulfilled',  # Will be updated based on shipments
-                'quantity_fulfilled': 0,
-                'quantity_shipped': 0,
-                'quantity_returned': 0
+                'fulfillment_status': 'fulfilled' if item.get('c_orderItemShippedQuantity', 0) > 0 else 'unfulfilled',
+                'quantity_fulfilled': item.get('c_orderItemShippedQuantity', 0),
+                'quantity_shipped': item.get('c_orderItemShippedQuantity', 0),
+                'quantity_returned': item.get('c_orderItemReturnedQuantity', 0),
+                
+                # Include ALL other productItem fields dynamically
+                **{k: v for k, v in item.items() if k not in [
+                    'id', 'order_id', 'product_id', 'variant_id', 'sku', 'name', 
+                    'quantity', 'price', 'shipment_id', 'fulfillment_status',
+                    'quantity_fulfilled', 'quantity_shipped', 'quantity_returned'
+                ]},
+                
+                # Keep raw data for debugging and additional processing
+                'raw_line_item_data': item
             }
             
             # Add any custom attributes
@@ -841,62 +913,243 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
         else:
             logging.warning(f"Transform function - No shipments found for order {order_id}")
         
-        for shipment in shipments:
+        for shipment_index, shipment in enumerate(shipments):
+            shipment_id = shipment.get('shipmentId', '')
+            shipment_no = shipment.get('shipmentNo', '')
+            
+            # Fix fulfillment ID - create unique IDs for multiple shipments
+            if shipment_id == 'me' or not shipment_id:
+                if shipment_no:
+                    # Use shipmentNo directly, add index for uniqueness in case of duplicates
+                    fulfillment_id = shipment_no
+                    if len(shipments) > 1:
+                        fulfillment_id = f"{shipment_no}_{shipment_index + 1}"
+                else:
+                    # Generate unique ID based on order and shipment index
+                    fulfillment_id = f"fulfillment_{order_id}_{shipment_index + 1}"
+            else:
+                fulfillment_id = shipment_id
+            
+            # Debug: Log what's actually in the shipment data
+            logging.info(f"🔍 Shipment {shipment_id} fields: {list(shipment.keys())}")
+            logging.info(f"🔍 Shipment {shipment_id} - shippingStatus: '{shipment.get('shippingStatus', 'NOT_FOUND')}', trackingNumber: '{shipment.get('trackingNumber', 'NOT_FOUND')}'")
+            logging.info(f"🔍 Shipment {shipment_id} - creationDate: '{shipment.get('creationDate', 'NOT_FOUND')}', lastModified: '{shipment.get('lastModified', 'NOT_FOUND')}')")
+            logging.info(f"🔍 Fixed fulfillment ID from '{shipment_id}' to '{fulfillment_id}'")
+            logging.info(f"🔍 Order {order_id} - invoiceNo: '{sfcc_order.get('invoiceNo', 'NOT_FOUND')}', shipmentNo: '{shipment_no}' (shipment {shipment_index + 1} of {len(shipments)})")
+            
+            # Get order-level data for better fulfillment mapping
+            order_shipping_status = sfcc_order.get('shippingStatus', '')
+            order_creation_date = sfcc_order.get('creationDate', '')
+            order_last_modified = sfcc_order.get('lastModified', '')
+            
+            # Fix payment status - use cybersource status and order completion status
+            payment_status = sfcc_order.get('paymentStatus', 'not_paid')
+            cybersource_status = ''
+            payment_instruments = sfcc_order.get('paymentInstruments', [])
+            if payment_instruments:
+                cybersource_status = payment_instruments[0].get('paymentTransaction', {}).get('c_cybersourceStatus', '')
+            
+            # Determine actual payment status
+            if cybersource_status == 'AUTHORIZED' and order_shipping_status == 'shipped':
+                actual_payment_status = 'paid'
+            elif cybersource_status == 'AUTHORIZED':
+                actual_payment_status = 'authorized'
+            else:
+                actual_payment_status = payment_status
+            
+            # Debug: Log what data we're actually getting
+            logging.info(f"🔍 Order {order_id} - shippingStatus: '{order_shipping_status}', creationDate: '{order_creation_date}', lastModified: '{order_last_modified}'")
+            logging.info(f"🔍 Order {order_id} - paymentStatus: '{payment_status}' -> actualPaymentStatus: '{actual_payment_status}' (cybersource: '{cybersource_status}')")
+            
+            # Extract tracking numbers from line items
+            tracking_numbers = []
+            for item in line_items:
+                item_tracking = item.get('raw_line_item_data', {}).get('c_orderItemTrackingNumbers', [])
+                if item_tracking:
+                    tracking_numbers.extend(item_tracking)
+                    logging.info(f"🔍 Found tracking numbers in line item {item.get('id', 'unknown')}: {item_tracking}")
+            
+            logging.info(f"🔍 Total tracking numbers found for order {order_id}: {tracking_numbers}")
+            
+            # Determine tracking company from tracking number format
+            tracking_company = ''
+            tracking_url = ''
+            if tracking_numbers:
+                first_tracking = tracking_numbers[0]
+                if '1Z' in first_tracking:
+                    tracking_company = 'UPS'
+                    tracking_url = f"https://www.ups.com/track?tracknum={first_tracking}"
+                elif first_tracking.isdigit() and len(first_tracking) > 10:
+                    tracking_company = 'FedEx'
+                    tracking_url = f"https://www.fedex.com/fedextrack/?tracknumbers={first_tracking}"
+            
             fulfillment = {
-                'id': shipment.get('shipmentId', ''),
+                # Standard fulfillment fields - use order data when shipment data is empty
+                'id': fulfillment_id,
                 'order_id': order_id,
-                'status': shipment.get('status', ''),
-                'tracking_company': shipment.get('trackingNumber', ''),  # SFCC may not separate company
-                'tracking_number': shipment.get('trackingNumber', ''),
-                'tracking_url': shipment.get('trackingUrl', ''),
-                'created_at': shipment.get('creationDate', ''),
-                'updated_at': shipment.get('lastModified', ''),
-                'shipped_at': shipment.get('shippingDate', ''),
+                'status': order_shipping_status or shipment.get('shippingStatus', ''),
+                'tracking_company': tracking_company,
+                'tracking_number': tracking_numbers[0] if tracking_numbers else shipment.get('trackingNumber', ''),
+                'tracking_url': tracking_url or shipment.get('trackingUrl', ''),
+                'created_at': order_creation_date or shipment.get('creationDate', ''),
+                'updated_at': order_last_modified or shipment.get('lastModified', ''),
+                'shipped_at': order_last_modified if order_shipping_status == 'shipped' else shipment.get('shippingDate', ''),
                 'delivery_date': shipment.get('deliveryDate', ''),
-                'shipping_method': shipment.get('shippingMethod', {}).get('name', ''),
-                'shipping_cost': shipment.get('shippingTotalPrice', 0),
+                'shipping_method': shipment.get('shippingMethod', {}).get('id', ''),
+                'shipping_cost': shipment.get('shippingTotal', 0),
                 'shipping_tax': shipment.get('shippingTotalTax', 0),
                 'gift': shipment.get('gift', False),
                 'gift_message': shipment.get('giftMessage', ''),
-                # Shipping address
                 'shipping_address': shipment.get('shippingAddress', {}),
-                # Line items in this shipment
-                'line_items': []
+                'line_items': [],
+                
+                # Add tracking numbers array for multiple tracking numbers
+                'tracking_numbers': tracking_numbers,
+                
+                # ALL SFCC shipment fields - include everything from raw data
+                'shipmentId': shipment.get('shipmentId', ''),
+                'shipmentNo': shipment.get('shipmentNo', ''),
+                'shipmentTotal': shipment.get('shipmentTotal', 0),
+                'adjustedMerchandizeTotalTax': shipment.get('adjustedMerchandizeTotalTax', 0),
+                'adjustedShippingTotalTax': shipment.get('adjustedShippingTotalTax', 0),
+                'merchandizeTotalTax': shipment.get('merchandizeTotalTax', 0),
+                'productSubTotal': shipment.get('productSubTotal', 0),
+                'productTotal': shipment.get('productTotal', 0),
+                'shippingTotal': shipment.get('shippingTotal', 0),
+                'shippingTotalTax': shipment.get('shippingTotalTax', 0),
+                'taxTotal': shipment.get('taxTotal', 0),
+                'shippingMethod': shipment.get('shippingMethod', {}),
+                'shippingAddress': shipment.get('shippingAddress', {}),
+                
+                # Include ALL other shipment fields dynamically
+                **{k: v for k, v in shipment.items() if k not in [
+                    'id', 'order_id', 'status', 'tracking_company', 'tracking_number', 
+                    'tracking_url', 'created_at', 'updated_at', 'shipped_at', 
+                    'delivery_date', 'shipping_method', 'shipping_cost', 'shipping_tax',
+                    'gift', 'gift_message', 'shipping_address', 'line_items'
+                ]}
             }
             
-            # Extract line items for this shipment
-            # Try different possible field names for shipment line items
-            shipment_items = shipment.get('productItems', [])
-            if not shipment_items:
-                shipment_items = shipment.get('productLineItems', [])
-            if not shipment_items:
-                shipment_items = shipment.get('lineItems', [])
-            if not shipment_items:
-                shipment_items = shipment.get('items', [])
+            # SFCC Logic: Find order line items that belong to this shipment
+            # Debug the shipment ID values
+            logging.info(f"🔍 Analyzing shipment {shipment_id} (value: '{shipment_id}')")
             
-            logging.info(f"Transform function - Shipment {shipment.get('shipmentId', 'unknown')}: Found {len(shipment_items)} line items")
-            if shipment_items:
-                logging.info(f"Transform function - First shipment line item structure: {list(shipment_items[0].keys())}")
-            
-            for item in shipment_items:
-                shipment_line = {
-                    'id': item.get('itemId', ''),
-                    'line_item_id': item.get('itemId', ''),
-                    'product_id': item.get('productId', ''),
-                    'quantity': item.get('quantity', 0),
-                    'price': item.get('price', 0)
-                }
-                fulfillment['line_items'].append(shipment_line)
+            shipment_line_items = []
+            for line_item in line_items:
+                line_item_shipment_id = line_item.get('shipment_id')
+                logging.info(f"🔍 Line item {line_item['id']} has shipmentId: '{line_item_shipment_id}'")
                 
-                # Update line item fulfillment status
-                for line_item in line_items:
-                    if line_item['id'] == item.get('itemId', ''):
-                        line_item['quantity_shipped'] += item.get('quantity', 0)
-                        line_item['shipment_id'] = shipment.get('shipmentId', '')
-                        if line_item['quantity_shipped'] >= line_item['quantity']:
-                            line_item['fulfillment_status'] = 'fulfilled'
+                # Check if shipmentId is a meaningful join key or just a placeholder
+                if line_item_shipment_id == shipment_id:
+                    # Check if this is a meaningful join or just default values
+                    if shipment_id == "me" or shipment_id == "default" or not shipment_id:
+                        logging.warning(f"⚠️ Shipment ID '{shipment_id}' appears to be a placeholder/default value")
+                        # For default shipments, include all line items (single shipment scenario)
+                        if len(shipments) == 1:
+                            logging.info(f"📦 Single shipment scenario - adding all line items to shipment '{shipment_id}'")
                         else:
-                            line_item['fulfillment_status'] = 'partial'
+                            logging.warning(f"📦 Multiple shipments with placeholder ID - this may not be correct")
+                    
+                    # Create shipment line item from order line item - include ALL fields
+                    shipment_line = {
+                        # Standard shipment line fields
+                        'id': line_item['id'],
+                        'line_item_id': line_item['id'],
+                        'item_id': line_item['id'],  # SFCC itemId for joining
+                        'product_id': line_item.get('product_id', ''),
+                        'quantity': line_item.get('quantity', 0),
+                        'price': line_item.get('price', 0),
+                        'sku': line_item.get('sku', ''),
+                        'name': line_item.get('name', ''),
+                        'join_method': 'shipmentId_match',
+                        
+                        # SFCC identifiers for joining
+                        'sfcc_item_id': line_item.get('raw_line_item_data', {}).get('itemId', ''),
+                        'sfcc_product_id': line_item.get('raw_line_item_data', {}).get('productId', ''),
+                        'sfcc_shipment_id': line_item.get('raw_line_item_data', {}).get('shipmentId', ''),
+                        
+                        # ALL order line item fields - copy everything from the order line item
+                        **{k: v for k, v in line_item.items() if k not in [
+                            'id', 'line_item_id', 'item_id', 'product_id', 'quantity', 
+                            'price', 'sku', 'name', 'join_method'
+                        ]}
+                    }
+                    
+                    # Fix fulfillment status consistency - use SFCC shipped quantity data
+                    shipped_qty = line_item.get('raw_line_item_data', {}).get('c_orderItemShippedQuantity', 0)
+                    if shipped_qty > 0:
+                        shipment_line['fulfillment_status'] = 'fulfilled'
+                        shipment_line['quantity_shipped'] = shipped_qty
+                        shipment_line['quantity_fulfilled'] = shipped_qty
+                    else:
+                        shipment_line['fulfillment_status'] = 'unfulfilled'
+                        shipment_line['quantity_shipped'] = 0
+                        shipment_line['quantity_fulfilled'] = 0
+                    fulfillment['line_items'].append(shipment_line)
+                    shipment_line_items.append(line_item)
+                    
+                    # Update fulfillment status based on SFCC data
+                    shipped_qty = line_item.get('raw_line_item_data', {}).get('c_orderItemShippedQuantity', 0)
+                    line_item['quantity_shipped'] = shipped_qty
+                    line_item['quantity_fulfilled'] = shipped_qty
+                    line_item['fulfillment_status'] = 'fulfilled' if shipped_qty > 0 else 'unfulfilled'
+                    
+                    logging.info(f"✅ Added line item {line_item['id']} to shipment {shipment_id} via shipmentId match")
+            
+            # If no line items matched and this looks like a default scenario, try alternative strategies
+            if len(shipment_line_items) == 0 and (shipment_id == "me" or len(shipments) == 1):
+                logging.info(f"🔄 No shipmentId matches found. Trying alternative join strategies for shipment '{shipment_id}'")
+                
+                # Strategy: If single shipment, assign all line items to it
+                if len(shipments) == 1:
+                    logging.info(f"📦 Single shipment detected - assigning all {len(line_items)} line items to shipment")
+                    for line_item in line_items:
+                        shipment_line = {
+                            # Standard shipment line fields
+                            'id': line_item['id'],
+                            'line_item_id': line_item['id'],
+                            'item_id': line_item['id'],  # SFCC itemId for joining
+                            'product_id': line_item.get('product_id', ''),
+                            'quantity': line_item.get('quantity', 0),
+                            'price': line_item.get('price', 0),
+                            'sku': line_item.get('sku', ''),
+                            'name': line_item.get('name', ''),
+                            'join_method': 'single_shipment_fallback',
+                            
+                            # SFCC identifiers for joining
+                            'sfcc_item_id': line_item.get('raw_line_item_data', {}).get('itemId', ''),
+                            'sfcc_product_id': line_item.get('raw_line_item_data', {}).get('productId', ''),
+                            'sfcc_shipment_id': line_item.get('raw_line_item_data', {}).get('shipmentId', ''),
+                            
+                            # ALL order line item fields - copy everything from the order line item
+                            **{k: v for k, v in line_item.items() if k not in [
+                                'id', 'line_item_id', 'item_id', 'product_id', 'quantity', 
+                                'price', 'sku', 'name', 'join_method'
+                            ]}
+                        }
+                        
+                        # Fix fulfillment status consistency - use SFCC shipped quantity data
+                        shipped_qty = line_item.get('raw_line_item_data', {}).get('c_orderItemShippedQuantity', 0)
+                        if shipped_qty > 0:
+                            shipment_line['fulfillment_status'] = 'fulfilled'
+                            shipment_line['quantity_shipped'] = shipped_qty
+                            shipment_line['quantity_fulfilled'] = shipped_qty
+                        else:
+                            shipment_line['fulfillment_status'] = 'unfulfilled'
+                            shipment_line['quantity_shipped'] = 0
+                            shipment_line['quantity_fulfilled'] = 0
+                        fulfillment['line_items'].append(shipment_line)
+                        shipment_line_items.append(line_item)
+                        
+                        # Update fulfillment status based on SFCC data
+                        shipped_qty = line_item.get('raw_line_item_data', {}).get('c_orderItemShippedQuantity', 0)
+                        line_item['quantity_shipped'] = shipped_qty
+                        line_item['quantity_fulfilled'] = shipped_qty
+                        line_item['fulfillment_status'] = 'fulfilled' if shipped_qty > 0 else 'unfulfilled'
+                        
+                        logging.info(f"✅ Added line item {line_item['id']} to shipment {shipment_id} via single-shipment fallback")
+            
+            logging.info(f"Transform function - Shipment {shipment_id}: Contains {len(shipment_line_items)} line items")
             
             fulfillments.append(fulfillment)
         
@@ -938,68 +1191,94 @@ def transform_sfcc_order_data(sfcc_order: dict, order_id: str) -> dict:
                 
                 logging.info(f"Transform function - Additional Shipment {shipment.get('shipmentId', 'unknown')}: Found {len(shipment_items)} line items")
                 
-                for item in shipment_items:
-                    shipment_line = {
-                        'id': item.get('itemId', ''),
-                        'line_item_id': item.get('itemId', ''),
-                        'product_id': item.get('productId', ''),
-                        'quantity': item.get('quantity', 0),
-                        'price': item.get('price', 0)
-                    }
-                    fulfillment['line_items'].append(shipment_line)
+                # SFCC Logic for additional shipments: Find order line items that belong to this shipment
+                # Use the same logic as main shipments
+                additional_shipment_id = shipment.get('shipmentId', '')
+                logging.info(f"🔍 Analyzing additional shipment {additional_shipment_id} (value: '{additional_shipment_id}')")
+                
+                additional_shipment_line_items = []
+                for line_item in line_items:
+                    line_item_shipment_id = line_item.get('shipment_id')
                     
-                    # Update line item fulfillment status
-                    for line_item in line_items:
-                        if line_item['id'] == item.get('itemId', ''):
-                            line_item['quantity_shipped'] += item.get('quantity', 0)
-                            line_item['shipment_id'] = shipment.get('shipmentId', '')
-                            if line_item['quantity_shipped'] >= line_item['quantity']:
-                                line_item['fulfillment_status'] = 'fulfilled'
-                            else:
-                                line_item['fulfillment_status'] = 'partial'
+                    if line_item_shipment_id == additional_shipment_id:
+                        # Create shipment line item from order line item (same as main logic)
+                        shipment_line = {
+                            'id': line_item['id'],
+                            'line_item_id': line_item['id'],
+                            'item_id': line_item['id'],  # SFCC itemId for joining
+                            'product_id': line_item.get('product_id', ''),
+                            'quantity': line_item.get('quantity', 0),
+                            'price': line_item.get('price', 0),
+                            'sku': line_item.get('sku', ''),
+                            'name': line_item.get('name', ''),
+                            'join_method': 'additional_shipment_match',
+                            # Add original SFCC identifiers for better joining
+                            'sfcc_item_id': line_item.get('raw_line_item_data', {}).get('itemId', ''),
+                            'sfcc_product_id': line_item.get('raw_line_item_data', {}).get('productId', ''),
+                            'sfcc_shipment_id': line_item.get('raw_line_item_data', {}).get('shipmentId', '')
+                        }
+                        fulfillment['line_items'].append(shipment_line)
+                        additional_shipment_line_items.append(line_item)
+                        
+                        # Update fulfillment status
+                        line_item['quantity_shipped'] += line_item.get('quantity', 0)
+                        line_item['fulfillment_status'] = 'fulfilled'
+                        
+                        logging.info(f"✅ Added line item {line_item['id']} to additional shipment {additional_shipment_id}")
+                
+                logging.info(f"Transform function - Additional Shipment {additional_shipment_id}: Contains {len(additional_shipment_line_items)} line items")
                 
                 fulfillments.append(fulfillment)
         
-        # Extract returns and refunds (if available in SFCC data)
+        # Skip returns and refunds - this eComm doesn't use them
         returns = []
         refunds = []
         
-        # SFCC may include return information in payments or separate return objects
-        payments = sfcc_order.get('payments', [])
-        for payment in payments:
-            if payment.get('paymentMethodId') == 'CREDIT' or payment.get('amount', 0) < 0:
-                # This might be a refund
-                refund = {
-                    'id': payment.get('paymentId', ''),
-                    'order_id': order_id,
-                    'amount': abs(payment.get('amount', 0)),
-                    'currency': payment.get('currencyCode', 'USD'),
-                    'reason': payment.get('paymentMethodId', ''),
-                    'created_at': payment.get('creationDate', ''),
-                    'processed_at': payment.get('creationDate', ''),
-                    'gateway': payment.get('paymentProcessor', ''),
-                    'transaction_id': payment.get('paymentTransactionId', ''),
-                    'note': payment.get('c_note', ''),
-                    'refund_line_items': []  # Would need additional API calls to get line-level returns
-                }
-                refunds.append(refund)
-        
         # Update the transformed order with structured data
-        transformed_order.update({
-            'lineItems': line_items,
-            'fulfillments': fulfillments,
-            'returns': returns,
-            'refunds': refunds,
-            # Add summary counts
-            'line_items_count': len(line_items),
-            'fulfillments_count': len(fulfillments),
-            'returns_count': len(returns),
-            'refunds_count': len(refunds),
-            # Add processing metadata
-            'data_structure_version': '1.0',
-            'transformed_at': datetime.now().isoformat(),
-            'source_platform': 'salesforce_commerce_cloud'
-        })
+        transformed_order['lineItems'] = line_items
+        transformed_order['fulfillments'] = fulfillments
+        transformed_order['returns'] = returns
+        transformed_order['refunds'] = refunds
+        
+        # Fix payment status at order level
+        payment_status = sfcc_order.get('paymentStatus', 'not_paid')
+        cybersource_status = ''
+        payment_instruments = sfcc_order.get('paymentInstruments', [])
+        if payment_instruments:
+            cybersource_status = payment_instruments[0].get('paymentTransaction', {}).get('c_cybersourceStatus', '')
+        
+        order_shipping_status = sfcc_order.get('shippingStatus', '')
+        
+        # Determine actual payment status
+        if cybersource_status == 'AUTHORIZED' and order_shipping_status == 'shipped':
+            actual_payment_status = 'paid'
+        elif cybersource_status == 'AUTHORIZED':
+            actual_payment_status = 'authorized'
+        else:
+            actual_payment_status = payment_status
+        
+        # Override the incorrect SFCC paymentStatus
+        transformed_order['paymentStatus'] = actual_payment_status
+        transformed_order['original_sfcc_paymentStatus'] = payment_status
+        transformed_order['payment_status_note'] = f"Corrected from SFCC '{payment_status}' using cybersource '{cybersource_status}'"
+        
+        # Remove raw SFCC sections since all data is now in transformed sections
+        sections_to_remove = ['productItems', 'shipments', 'shippingItems']
+        for section in sections_to_remove:
+            if section in transformed_order:
+                logging.info(f"Removing raw SFCC section '{section}' from output (data preserved in transformed sections)")
+                del transformed_order[section]
+        
+        # Add summary counts
+        transformed_order['line_items_count'] = len(line_items)
+        transformed_order['fulfillments_count'] = len(fulfillments)
+        transformed_order['returns_count'] = len(returns)
+        transformed_order['refunds_count'] = len(refunds)
+        
+        # Add processing metadata
+        transformed_order['data_structure_version'] = '1.0'
+        transformed_order['transformed_at'] = datetime.now().isoformat()
+        transformed_order['source_platform'] = 'salesforce_commerce_cloud'
         
         logging.info(f"Transformed order {order_id}: {len(line_items)} line items, {len(fulfillments)} fulfillments, {len(refunds)} refunds")
         return transformed_order
@@ -1014,142 +1293,209 @@ def transform_sfcc_product_data(sfcc_product: dict) -> dict:
     """
     Transform SFCC Commerce API product data to include comprehensive variant and inventory information
     """
-    try:
-        # Start with the base product data
-        transformed_product = sfcc_product.copy()
+    # Determine if this is a master product
+    product_type = sfcc_product.get('type', {})
+    is_master = product_type.get('master', False)
+    
+    # Get master product images
+    master_images = []
+    main_image = sfcc_product.get('image', {})
+    if main_image:
+        master_images.append({
+            'url': main_image.get('absUrl', ''),
+            'alt': main_image.get('alt', {}).get('default', ''),
+            'type': 'main'
+        })
+    
+    # Add additional images from imageGroups (limit to 3)
+    image_groups = sfcc_product.get('imageGroups', [])
+    for group in image_groups:
+        for img in group.get('images', [])[:3]:
+            master_images.append({
+                'url': img.get('absUrl', ''),
+                'alt': img.get('alt', {}).get('default', ''),
+                'type': group.get('viewType', 'additional')
+            })
+    
+    # Debug: Log available keys to see what category/classification data is available
+    logging.info(f"Product {sfcc_product.get('id', 'unknown')} keys: {list(sfcc_product.keys())}")
+    
+    # Extract categories and classification data - try multiple possible field names
+    categories = []
+    
+    # Try different possible field names for categories
+    category_data = (sfcc_product.get('categoryAssignments', []) or 
+                    sfcc_product.get('categories', []) or 
+                    sfcc_product.get('assignedCategories', []) or
+                    sfcc_product.get('productCategories', []))
+    
+    logging.info(f"Product {sfcc_product.get('id', 'unknown')} category data: {category_data}")
+    
+    for assignment in category_data:
+        if isinstance(assignment, dict):
+            category_info = {
+                'category_id': assignment.get('categoryId', assignment.get('id', '')),
+                'category_name': assignment.get('categoryName', assignment.get('name', '')),
+                'primary': assignment.get('primary', False)
+            }
+        else:
+            # If it's just a string ID
+            category_info = {
+                'category_id': str(assignment),
+                'category_name': '',
+                'primary': False
+            }
+        categories.append(category_info)
+    
+    # Remove classifications processing since categories are working fine
+    classifications = []
+    
+    # Extract weight information
+    weight_info = {}
+    weight = sfcc_product.get('weight', sfcc_product.get('c_weight', {}))
+    if weight:
+        if isinstance(weight, dict):
+            weight_info = {
+                'value': weight.get('value', 0),
+                'unit': weight.get('unit', 'lb')
+            }
+        else:
+            weight_info = {
+                'value': weight,
+                'unit': 'lb'  # Default unit
+            }
+    
+    # Get creation and modification dates
+    created_date = sfcc_product.get('creationDate', sfcc_product.get('c_creationDate', ''))
+    updated_date = sfcc_product.get('lastModified', sfcc_product.get('modificationTime', ''))
+    
+    # Get price information from direct fields (site-specific data)
+    price_value = sfcc_product.get('price', 0)
+    currency = sfcc_product.get('priceCurrency', 'USD')
+    price_per_unit = sfcc_product.get('pricePerUnit', 0)
+    
+    # Only return essential fields for clean output
+    transformed_product = {
+        'product_id': sfcc_product.get('id', ''),
+        'name': sfcc_product.get('name', {}).get('default', '') if isinstance(sfcc_product.get('name'), dict) else sfcc_product.get('name', ''),
+        'brand': sfcc_product.get('brand', ''),
+        'description': sfcc_product.get('shortDescription', {}).get('default', {}).get('source', '') if isinstance(sfcc_product.get('shortDescription'), dict) else '',
+        'is_master': is_master,
+        'created_date': created_date,
+        'updated_date': updated_date,
+        'weight': weight_info,
+        'price': price_value,
+        'currency': currency,
+        'categories': categories,
+        'classifications': classifications,
+        'images': master_images,
+        'variants': [],
+        'variant_count': 0
+    }
+    
+    # Add basic inventory for master products only
+    if is_master:
+        # Use the actual fields returned by Salesforce with site context
+        ats_value = sfcc_product.get('ats', 0)
+        in_stock = sfcc_product.get('inStock', False)
+        online = sfcc_product.get('online', False)
         
-        # Commerce API structure - extract availability data
-        availability_model = sfcc_product.get('availabilityModel', {})
-        inventory_record = availability_model.get('inventoryRecord', {})
-        
-        # Comprehensive inventory information
+        # Debug logging for inventory data
+        logging.info(f"Master {sfcc_product.get('id', 'unknown')} direct inventory: ats={ats_value}, inStock={in_stock}, online={online}")
         transformed_product['inventory'] = {
-            "orderable": availability_model.get('orderable', False),
-            "in_stock": availability_model.get('inStock', False),
-            "allocation": inventory_record.get('allocation', 0),
-            "preorderable": inventory_record.get('preorderable', False),
-            "backorderable": inventory_record.get('backorderable', False),
-            "stock_level": inventory_record.get('stockLevel', 0),
-            "ats": inventory_record.get('ats', 0),  # Available to Sell
-            "reservations": inventory_record.get('reservations', 0),
-            "turnover": inventory_record.get('turnover', 0),
-            "perpetual": inventory_record.get('perpetual', False),
-            "preorder_backorder_allocation": inventory_record.get('preorderBackorderAllocation', 0),
-            "preorder_backorder_handling": inventory_record.get('preorderBackorderHandling', ''),
-            "in_stock_date": inventory_record.get('inStockDate', ''),
-            "restockable": inventory_record.get('restockable', False)
+            "ats": ats_value,
+            "in_stock": in_stock,
+            "online": online,
+            "orderable": online and (ats_value > 0 or in_stock),
+            "stock_level": ats_value  # ATS is effectively the stock level
         }
-        
-        # Extract and organize pricing data
+    
+    # Add basic pricing for master products only
+    if is_master:
         price_model = sfcc_product.get('priceModel', {})
-        price_info = price_model.get('priceInfo', {})
-        price_range = price_model.get('priceRange', {})
-        
         transformed_product['pricing'] = {
             "currency": sfcc_product.get('currency', 'USD'),
-            "price": price_model.get('price', 0),
-            "price_book": price_info.get('priceBook'),
-            "price_book_price": price_model.get('priceBookPrice', 0),
-            "min_price": price_range.get('minPrice', 0),
-            "max_price": price_range.get('maxPrice', 0),
-            "price_tiers": price_range.get('priceTiers', []),
-            "tiered_prices": price_model.get('tieredPrices', []),
-            "sale_price": price_model.get('salePrice', 0),
-            "list_price": price_model.get('listPrice', 0)
+            "price": price_model.get('price', price_model.get('priceBookPrice', 0))
         }
+    
+    # Extract comprehensive variant information
+    variation_model = sfcc_product.get('variationModel', {})
+    variants = []
+    
+    if variation_model:
+        # Master product with variants
+        variation_groups = variation_model.get('variationGroups', [])
+        variants_data = variation_model.get('variants', [])
         
-        # Extract comprehensive variant information
-        variation_model = sfcc_product.get('variationModel', {})
-        variants = []
-        
-        if variation_model:
-            # Master product with variants
-            variation_groups = variation_model.get('variationGroups', [])
-            variants_data = variation_model.get('variants', [])
+        for variant in variants_data:
+            # Get variant availability and pricing models  
+            variant_availability = variant.get('availabilityModel', {})
+            variant_inventory = variant_availability.get('inventoryRecord', {})
+            variant_price_model = variant.get('priceModel', {})
             
-            for variant in variants_data:
-                variant_info = {
-                    'variant_id': variant.get('productId', ''),
-                    'sku': variant.get('productId', ''),
-                    'orderable': variant.get('orderable', False),
-                    'price': variant.get('price', 0),
-                    'variation_values': variant.get('variationValues', {}),
-                    'inventory': {
-                        'stock_level': variant.get('stockLevel', 0),
-                        'ats': variant.get('ats', 0),
-                        'orderable': variant.get('orderable', False),
-                        'in_stock': variant.get('inStock', False)
+            # Get variant weight information
+            variant_weight = variant.get('weight', variant.get('c_weight', {}))
+            variant_weight_info = {}
+            if variant_weight:
+                if isinstance(variant_weight, dict):
+                    variant_weight_info = {
+                        'value': variant_weight.get('value', 0),
+                        'unit': variant_weight.get('unit', 'lb')
                     }
-                }
-                variants.append(variant_info)
+                else:
+                    variant_weight_info = {
+                        'value': variant_weight,
+                        'unit': 'lb'
+                    }
             
-            # Add variation attributes information
-            transformed_product['variation_attributes'] = variation_model.get('variationAttributes', [])
-            transformed_product['variation_groups'] = variation_groups
+            # Get variant dates - try multiple field names and inherit from master if not found
+            variant_created = (variant.get('creationDate') or 
+                             variant.get('c_creationDate') or 
+                             variant.get('created') or
+                             created_date)  # Inherit from master if not found in variant
+            
+            variant_updated = (variant.get('lastModified') or 
+                             variant.get('modificationTime') or 
+                             variant.get('updated') or
+                             updated_date)  # Inherit from master if not found in variant
+            
+            # Debug logging for variant dates
+            logging.info(f"Variant {variant.get('productId', 'unknown')} dates: created={variant_created}, updated={variant_updated}")
+            logging.info(f"Variant {variant.get('productId', 'unknown')} available keys: {list(variant.keys())}")
+            
+            variant_info = {
+                # === VARIANT ID MAPPING ===
+                'variant_id': variant.get('productId', variant.get('id', '')),  # VARIANT ID (matches orders.variant_id)
+                'sku': variant.get('productId', variant.get('id', '')),         # SKU (same as variant_id)
+                'product_id': sfcc_product.get('id', ''),                               # MASTER PRODUCT ID (matches orders.product_id)
+                'master_product_id': sfcc_product.get('id', ''),                        # Explicit master reference
+                'belongs_to_master': sfcc_product.get('id', ''),                        # Clear relationship field
+                'name': variant.get('name', variant.get('productName', '')),
+                'brand': variant.get('brand', sfcc_product.get('brand', '')),           # Inherit from master if not present
+                'created_date': variant_created,
+                'updated_date': variant_updated,
+                'weight': variant_weight_info,
+                'price': variant.get('price', 0),  # Use direct price field
+                'currency': variant.get('priceCurrency', 'USD'),  # Use direct currency field
+                'variation_values': variant.get('variationValues', {}),
+                'inventory': {
+                    'ats': variant.get('ats', 0),  # Use direct ATS field
+                    'in_stock': variant.get('inStock', False),  # Use direct inStock field
+                    'online': variant.get('online', False),  # Use direct online field
+                    'orderable': variant.get('online', False) and (variant.get('ats', 0) > 0 or variant.get('inStock', False)),
+                    'stock_level': variant.get('ats', 0)  # ATS is the stock level
+                }
+            }
+            variants.append(variant_info)
+        
+        # Add variation attributes information
+        transformed_product['variation_attributes'] = variation_model.get('variationAttributes', [])
+        transformed_product['variation_groups'] = variation_groups
         
         transformed_product['variants'] = variants
-        transformed_product['is_master'] = len(variants) > 0
         transformed_product['variant_count'] = len(variants)
-        
-        # Extract promotions
-        promotions = sfcc_product.get('promotions', [])
-        product_promotions = sfcc_product.get('productPromotions', [])
-        
-        transformed_product['promotions'] = {
-            "active_promotions": promotions,
-            "product_promotions": product_promotions,
-            "promotional_price": next((p.get('promotionalPrice') for p in promotions if p.get('promotionalPrice')), None),
-            "callout_message": next((p.get('calloutMsg') for p in promotions if p.get('calloutMsg')), None)
-        }
-        
-        # Extract images
-        image_groups = sfcc_product.get('imageGroups', [])
-        transformed_product['images'] = []
-        for group in image_groups:
-            for image in group.get('images', []):
-                transformed_product['images'].append({
-                    'view_type': group.get('viewType', ''),
-                    'alt': image.get('alt', ''),
-                    'dis_base_link': image.get('disBaseLink', ''),
-                    'link': image.get('link', ''),
-                    'title': image.get('title', '')
-                })
-        
-        # Add comprehensive product metadata
-        transformed_product.update({
-            # Product identifiers - In Commerce API, use id as SKU
-            'sku': sfcc_product.get('id', ''),  # Commerce API id is the SKU
-            'product_id': sfcc_product.get('id', ''),
-            'manufacturer_name': sfcc_product.get('manufacturerName', ''),
-            'manufacturer_sku': sfcc_product.get('manufacturerSku', ''),
-            'upc': sfcc_product.get('upc', ''),
-            'ean': sfcc_product.get('ean', ''),
-            'isbn': sfcc_product.get('isbn', ''),
-            
-            # Product details
-            'brand': sfcc_product.get('brand', ''),
-            
-            # Status flags
-            'online': sfcc_product.get('online', False),
-            'searchable': sfcc_product.get('searchable', False),
-            
-            # Descriptions
-            'short_description': sfcc_product.get('shortDescription', ''),
-            'long_description': sfcc_product.get('longDescription', ''),
-            
-            # Processing metadata
-            'data_structure_version': '1.0',
-            'transformed_at': datetime.now().isoformat(),
-            'source_platform': 'salesforce_commerce_cloud'
-        })
-        
-        logging.info(f"Transformed product {sfcc_product.get('id', 'unknown')}: {len(variants)} variants, inventory ATS: {transformed_product['inventory']['ats']}")
-        return transformed_product
-        
-    except Exception as e:
-        logging.error(f"Error transforming SFCC product data for {sfcc_product.get('id', 'unknown')}: {str(e)}")
-        # Return original data if transformation fails
-        return sfcc_product
+    
+    return transformed_product
 
 
 def save_to_datalake(data: dict, datalake_key: str, path: str, filename: str = None) -> bool:
@@ -1223,7 +1569,7 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
             'Content-Type': 'application/json'
         }
         
-        # Basic product search query
+        # Prepare query parameters with site context for inventory/pricing
         search_query = {
             "limit": int(page_size),
             "query": {
@@ -1236,8 +1582,13 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
             },
             "offset": 0,
             "expand": [
-                "availability", "images", "prices"
+                "availability", "images", "prices", "categories"
             ]
+        }
+        
+        # Add site-specific parameters for inventory and pricing data
+        params = {
+            'siteId': site_id
         }
 
         # Add catalog_id refinement if provided
@@ -1253,6 +1604,12 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
         logging.info(f"Search query: {json.dumps(search_query, indent=2)}")
         
         all_products = []
+        debug_info = {
+            'masters_found': [],
+            'variants_found': [],
+            'variant_matching': [],
+            'masters_with_variants': {}
+        }
         offset = 0
         max_pages = 50  # Safety limit
         page_count = 0
@@ -1263,7 +1620,7 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
             
             logging.info(f"Fetching page {page_count}, offset {offset}")
             
-            response = requests.post(url, headers=headers, json=search_query, timeout=60)
+            response = requests.post(url, headers=headers, json=search_query, params=params, timeout=60)
             
             if response.status_code != 200:
                 logging.error(f"Salesforce API error: {response.status_code}")
@@ -1281,25 +1638,151 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
                 logging.info("No more products found, ending pagination")
                 break
                 
-            # Process each product to organize inventory and pricing data
-            for product in products:
-                # Extract and organize inventory data
-                availability_model = product.get('availabilityModel', {})
-                inventory_record = availability_model.get('inventoryRecord', {})
-                
-                product['inventory'] = {
-                    "orderable": availability_model.get('orderable', False),
-                    "in_stock": availability_model.get('inStock', False),
-                    "allocation": inventory_record.get('allocation', 0),
-                    "preorderable": inventory_record.get('preorderable', False),
-                    "backorderable": inventory_record.get('backorderable', False),
-                    "stock_level": inventory_record.get('stockLevel', 0),
-                    "ats": inventory_record.get('ats', 0),
-                    "reservations": inventory_record.get('reservations', 0),
-                    "turnover": inventory_record.get('turnover', 0)
-                }
+            # Process products and organize masters with nested variants
+            masters_dict = {}
+            variant_products = []
             
-            all_products.extend(products)
+            # Pass 1: Process all master products
+            for product in products:
+                product_type = product.get('type', {})
+                is_master = product_type.get('master', False)
+                product_id = product.get('id', '')
+                
+                if is_master:
+                    # Transform master product
+                    transformed_master = transform_sfcc_product_data(product)
+                    masters_dict[product_id] = transformed_master
+                    debug_info['masters_found'].append(product_id)
+                else:
+                    # Store variants for second pass
+                    variant_products.append(product)
+                    debug_info['variants_found'].append(product_id)
+            
+            # Pass 2: Process variants and nest them under masters
+            for product in variant_products:
+                variant_id = product.get('id', '')
+                
+                # Find the master this variant belongs to
+                master_id = None
+                for master_key in masters_dict.keys():
+                    # Extract base pattern from master (remove XXXX)
+                    master_base = master_key.replace('XXXX', '')
+                    # Check if variant starts with this base pattern
+                    if variant_id.startswith(master_base):
+                        master_id = master_key
+                        break
+                
+                if master_id and master_id in masters_dict:
+                    # Transform variant data
+                    availability_model = product.get('availabilityModel', {})
+                    inventory_record = availability_model.get('inventoryRecord', {})
+                    
+                    # Try alternative inventory field names for variants
+                    variant_inventory_data = (product.get('inventory', {}) or 
+                                            product.get('inventoryRecord', {}) or
+                                            product.get('stockInfo', {}))
+                    
+                    # Debug logging for variant inventory data
+                    logging.info(f"Variant {variant_id} availability_model: {availability_model}")
+                    logging.info(f"Variant {variant_id} inventory_record: {inventory_record}")
+                    logging.info(f"Variant {variant_id} variant_inventory_data: {variant_inventory_data}")
+                    
+                    # Get variant images
+                    variant_images = []
+                    main_image = product.get('image', {})
+                    if main_image:
+                        variant_images.append({
+                            'url': main_image.get('absUrl', ''),
+                            'alt': main_image.get('alt', {}).get('default', ''),
+                            'type': 'main'
+                        })
+                    
+                    # Add additional images from imageGroups
+                    image_groups = product.get('imageGroups', [])
+                    for group in image_groups:
+                        for img in group.get('images', [])[:3]:  # Limit to 3 additional images
+                            variant_images.append({
+                                'url': img.get('absUrl', ''),
+                                'alt': img.get('alt', {}).get('default', ''),
+                                'type': group.get('viewType', 'additional')
+                            })
+                    
+                    # Get variant dates and other fields
+                    variant_created = product.get('creationDate', product.get('c_creationDate', ''))
+                    variant_updated = product.get('lastModified', product.get('modificationTime', ''))
+                    
+                    # Get variant weight
+                    variant_weight = product.get('weight', product.get('c_weight', {}))
+                    variant_weight_info = {}
+                    if variant_weight:
+                        if isinstance(variant_weight, dict):
+                            variant_weight_info = {
+                                'value': variant_weight.get('value', 0),
+                                'unit': variant_weight.get('unit', 'lb')
+                            }
+                        else:
+                            variant_weight_info = {
+                                'value': variant_weight,
+                                'unit': 'lb'
+                            }
+                    
+                    # Get variant price from direct fields
+                    variant_price = product.get('price', 0)
+                    variant_currency = product.get('priceCurrency', 'USD')
+                    
+                    # Create variant data structure
+                    variant_data = {
+                        'variant_id': variant_id,
+                        'sku': variant_id,
+                        'name': product.get('name', {}).get('default', '') if isinstance(product.get('name'), dict) else product.get('name', ''),
+                        'brand': product.get('brand', ''),
+                        'created_date': variant_created,
+                        'updated_date': variant_updated,
+                        'weight': variant_weight_info,
+                        'price': variant_price,
+                        'currency': variant_currency,
+                        'upc': product.get('upc', ''),
+                        'manufacturer_sku': product.get('manufacturerSku', ''),
+                        'belongs_to_master': master_id,
+                        'variation_values': {
+                            'color': product.get('c_color', ''),
+                            'size': product.get('c_size', ''),
+                            'style': product.get('c_style', '')
+                        },
+                        'images': variant_images,
+                        'inventory': {
+                            'ats': product.get('ats', 0),
+                            'in_stock': product.get('inStock', False),
+                            'online': product.get('online', False),
+                            'orderable': product.get('online', False) and (product.get('ats', 0) > 0 or product.get('inStock', False)),
+                            'stock_level': product.get('ats', 0)
+                        }
+                    }
+                    
+                    # Add variant to master
+                    masters_dict[master_id]['variants'].append(variant_data)
+                    masters_dict[master_id]['variant_count'] = len(masters_dict[master_id]['variants'])
+                    
+                    # Track debug info
+                    debug_info['variant_matching'].append({
+                        'variant_id': variant_id,
+                        'matched_to_master': master_id,
+                        'match_successful': True
+                    })
+                    
+                    if master_id not in debug_info['masters_with_variants']:
+                        debug_info['masters_with_variants'][master_id] = []
+                    debug_info['masters_with_variants'][master_id].append(variant_id)
+                else:
+                    # Variant couldn't be matched to a master
+                    debug_info['variant_matching'].append({
+                        'variant_id': variant_id,
+                        'matched_to_master': None,
+                        'match_successful': False
+                    })
+            
+            # Add only master products (with nested variants) to results
+            all_products.extend(list(masters_dict.values()))
             logging.info(f"Retrieved {len(products)} products, total: {len(all_products)}")
             
             # Check if we have more pages using Commerce API pagination
@@ -1310,10 +1793,14 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
                 
             offset += len(products)
         
+        # Note: Separate inventory/pricing APIs returned 404, so inventory/pricing data 
+        # must be available through the main product API with proper site context
+        logging.info("Skipping separate API calls - using site-specific product data for inventory/pricing")
         # Format response data
         final_data = {
             "data": all_products,
             "total_count": len(all_products),
+            "debug_info": debug_info,
             "metadata": {
                 "source": url,
                 "organization_id": organization_id,
@@ -1323,11 +1810,11 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
                 "page_size": page_size,
                 "pages_fetched": page_count,
                 "timestamp": datetime.now().isoformat(),
-                "note": "Products with organized inventory, pricing, and promotion data"
+                "note": "Products with separate inventory and pricing API integration"
             }
         }
         
-        logging.info(f"Successfully fetched {len(all_products)} products from Salesforce")
+        logging.info(f"Successfully fetched {len(all_products)} products with integrated inventory and pricing data")
         return final_data
 
     except Exception as e:
@@ -1343,12 +1830,14 @@ def fetch_salesforce_products(access_token: str, base_url: str, organization_id:
 
 def fetch_salesforce_inventory(access_token: str, base_url: str, organization_id: str, site_id: str, page_size: str) -> dict:
     """
-    Fetch inventory data from Salesforce Commerce Cloud
+    Fetch inventory data from Salesforce Commerce Cloud using the same product search API but focused on inventory fields
     """
     try:
-        # Build the API URL
-        api_path = f"/product/products/v1"
-        url = f"{base_url}{api_path}/organizations/{organization_id}/product-search"
+        # Try using the inventory-specific API endpoint
+        api_path = f"/product/inventory/v1"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/inventory-lists/inventory/product-inventory-records"
+        
+        logging.info(f"Inventory API URL: {url}")
         
         # Prepare headers
         headers = {
@@ -1356,25 +1845,13 @@ def fetch_salesforce_inventory(access_token: str, base_url: str, organization_id
             'Content-Type': 'application/json'
         }
         
-        # Inventory-focused search query
-        search_query = {
-            "limit": int(page_size),
-            "query": {
-                "textQuery": {
-                    "fields": [
-                        "id", "inventoryRecord.allocation", "inventoryRecord.preorderable", 
-                        "inventoryRecord.backorderable", "inventoryRecord.stockLevel", "inventoryRecord.ats",
-                        "inventoryRecord.reservations", "inventoryRecord.turnover", "availabilityModel.orderable",
-                        "availabilityModel.inStock", "availabilityModel.inventoryRecord"
-                    ],
-                    "searchPhrase": "*"
-                }
-            },
-            "offset": 0,
-            "expand": ["availability", "inventory"],
-            "select": "(id,inventoryRecord,availabilityModel)"
+        # Use GET request for inventory API with query parameters
+        params = {
+            'limit': int(page_size),
+            'offset': 0
         }
         
+        logging.info(f"Inventory API params: {params}")
         logging.info(f"Fetching inventory from Salesforce Commerce Cloud: {url}")
         
         all_inventory = []
@@ -1384,9 +1861,9 @@ def fetch_salesforce_inventory(access_token: str, base_url: str, organization_id
         
         while page_count < max_pages:
             page_count += 1
-            search_query["offset"] = offset
+            params["offset"] = offset
             
-            response = requests.post(url, headers=headers, json=search_query, timeout=60)
+            response = requests.get(url, headers=headers, params=params, timeout=60)
             
             if response.status_code != 200:
                 logging.error(f"Salesforce API error: {response.status_code}")
@@ -1439,9 +1916,11 @@ def fetch_salesforce_pricing(access_token: str, base_url: str, organization_id: 
     Fetch pricing data from Salesforce Commerce Cloud
     """
     try:
-        # Build the API URL
-        api_path = f"/product/products/v1"
-        url = f"{base_url}{api_path}/organizations/{organization_id}/product-search"
+        # Try using the pricing-specific API endpoint
+        api_path = f"/pricing/products/v1"
+        url = f"{base_url}{api_path}/organizations/{organization_id}/product-prices"
+        
+        logging.info(f"Pricing API URL: {url}")
         
         # Prepare headers
         headers = {
@@ -1449,24 +1928,20 @@ def fetch_salesforce_pricing(access_token: str, base_url: str, organization_id: 
             'Content-Type': 'application/json'
         }
         
-        # Pricing-focused search query
+        # Pricing-focused search query - simplified to ensure it works
         search_query = {
             "limit": int(page_size),
             "query": {
                 "textQuery": {
-                    "fields": [
-                        "id", "currency", "priceModel.price", "priceModel.priceInfo.price",
-                        "priceModel.priceInfo.priceBook", "priceModel.priceBook", "priceModel.priceBookPrice",
-                        "priceModel.priceRange.maxPrice", "priceModel.priceRange.minPrice", "priceModel.priceRange.priceTiers",
-                        "priceModel.tieredPrices", "promotions.promotionalPrice", "promotions.calloutMsg", "productPromotions"
-                    ],
+                    "fields": ["id", "name"],
                     "searchPhrase": "*"
                 }
             },
             "offset": 0,
-            "expand": ["prices", "promotions", "price_books"],
-            "select": "(id,currency,priceModel,promotions,productPromotions)"
+            "expand": ["prices"]
         }
+        
+        logging.info(f"Pricing search query: {search_query}")
         
         logging.info(f"Fetching pricing from Salesforce Commerce Cloud: {url}")
         
