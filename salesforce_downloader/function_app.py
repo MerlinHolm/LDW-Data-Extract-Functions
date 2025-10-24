@@ -1333,9 +1333,32 @@ def transform_sfcc_product_data(sfcc_product: dict) -> dict:
     
     for assignment in category_data:
         if isinstance(assignment, dict):
+            # Debug: Log all available keys in the category assignment
+            logging.info(f"Category assignment keys: {list(assignment.keys())}")
+            logging.info(f"Category assignment full data: {assignment}")
+            
+            # Try multiple possible field names for category ID
+            category_id = (assignment.get('id') or 
+                          assignment.get('categoryId') or 
+                          assignment.get('category_id') or
+                          assignment.get('categoryID') or
+                          assignment.get('Category_ID') or
+                          assignment.get('c_categoryId') or
+                          '')
+            
+            # Try multiple possible field names for category name  
+            category_name = (assignment.get('name') or
+                           assignment.get('categoryName') or
+                           assignment.get('category_name') or
+                           assignment.get('displayName') or
+                           assignment.get('title') or
+                           '')
+            
+            logging.info(f"Extracted category_id: '{category_id}', category_name: '{category_name}'")
+            
             category_info = {
-                'category_id': assignment.get('categoryId', assignment.get('id', '')),
-                'category_name': assignment.get('categoryName', assignment.get('name', '')),
+                'category_id': category_id,
+                'category_name': category_name,
                 'primary': assignment.get('primary', False)
             }
         else:
