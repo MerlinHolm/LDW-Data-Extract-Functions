@@ -8,8 +8,8 @@ from azure.storage.filedatalake import DataLakeServiceClient
 
 app = func.FunctionApp()
 
-@app.route(route="get_magento_data", auth_level=func.AuthLevel.FUNCTION)
-def get_magento_data(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="get_order_data", auth_level=func.AuthLevel.FUNCTION)
+def get_order_data(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing Magento data request')
     
     try:
@@ -201,8 +201,8 @@ def get_magento_data(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-@app.route(route="get_magento_products", auth_level=func.AuthLevel.FUNCTION)
-def get_magento_products(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="get_product_data", auth_level=func.AuthLevel.FUNCTION)
+def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Processing Magento products request')
     
     try:

@@ -20,7 +20,7 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
         filename_prefix = req.params.get('filename', 'shopify')
         datalake_key = req.params.get('datalake_key')
         data_lake_path = req.params.get('data_lake_path', 'RetailProducts/input/files/json/products/base')
-        page_size = req.params.get('page_size', '250')
+        page_size = req.params.get('page_size', '100')
 
         # Validate required parameters
         if not auth_token:
@@ -175,13 +175,13 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
             'Accept': 'application/json'
         }
 
-        # Scale nested query sizes based on main page_size for better performance
+        # Set consistent limits for pagination - keeping all at 100 for rate limiting
         main_page_size = int(page_size)
-        collections_limit = min(10, max(5, main_page_size // 25))  # 5-10 collections
-        variants_limit = min(50, max(10, main_page_size // 5))     # 10-50 variants  
-        media_limit = min(25, max(5, main_page_size // 10))        # 5-25 media items
+        collections_limit = 100  # Fixed at 100 for pagination
+        variants_limit = 100     # Fixed at 100 for pagination
+        media_limit = 100        # Fixed at 100 for pagination
         
-        logging.info(f"Scaled limits - Products: {main_page_size}, Collections: {collections_limit}, Variants: {variants_limit}, Media: {media_limit}")
+        logging.info(f"Fixed limits - Products: {main_page_size}, Collections: {collections_limit}, Variants: {variants_limit}, Media: {media_limit}")
 
         # GraphQL query for products with scaled nested limits
         graphql_query = {
@@ -241,6 +241,10 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
                                             height
                                         }}
                                     }}
+                                }}
+                                pageInfo {{
+                                    hasNextPage
+                                    endCursor
                                 }}
                             }}
                             options {{
@@ -346,6 +350,35 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
                 }
 
         logging.info(f"Completed fetching products. Total products: {len(all_products)}")
+        
+        # Fetch additional variants for products that have more variants
+        products_with_more_variants = 0
+        total_additional_variants = 0
+        
+        for product in all_products:
+            variants_data = product.get('variants', {})
+            variants_page_info = variants_data.get('pageInfo', {})
+            
+            if variants_page_info.get('hasNextPage', False):
+                products_with_more_variants += 1
+                logging.info(f"Product {product.get('id')} has more variants, fetching additional...")
+                
+                # Fetch additional variants for this product
+                additional_variants = fetch_additional_variants(
+                    auth_token, graphql_url, headers, product.get('id'), 
+                    variants_page_info.get('endCursor'), variants_limit
+                )
+                
+                if additional_variants:
+                    # Merge additional variants with existing ones
+                    existing_variants = variants_data.get('edges', [])
+                    existing_variants.extend(additional_variants)
+                    product['variants']['edges'] = existing_variants
+                    total_additional_variants += len(additional_variants)
+                    logging.info(f"Added {len(additional_variants)} additional variants for product {product.get('id')}")
+        
+        if products_with_more_variants > 0:
+            logging.info(f"Fetched additional variants for {products_with_more_variants} products, total additional variants: {total_additional_variants}")
 
         # Return data in consistent format
         return {
@@ -356,7 +389,10 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
                 "query_type": "GraphQL",
                 "pages_fetched": page_count,
                 "page_size": page_size,
-                "has_more_pages": has_next_page
+                "has_more_pages": has_next_page,
+                "products_with_additional_variants": products_with_more_variants,
+                "total_additional_variants_fetched": total_additional_variants,
+                "variant_pagination_enabled": True
             }
         }
 
@@ -376,6 +412,101 @@ def fetch_shopify_products(auth_token: str, graphql_url: str, page_size: str) ->
             "message": str(e),
             "traceback": traceback.format_exc()
         }
+
+
+def fetch_additional_variants(auth_token: str, graphql_url: str, headers: dict, product_id: str, cursor: str, variants_limit: int) -> list:
+    """
+    Fetch additional variants for a product using pagination
+    """
+    try:
+        all_additional_variants = []
+        has_next_page = True
+        current_cursor = cursor
+        max_variant_pages = 10  # Safety limit for variant pagination
+        variant_page_count = 0
+        
+        while has_next_page and variant_page_count < max_variant_pages:
+            variant_page_count += 1
+            
+            # GraphQL query to fetch more variants for a specific product
+            variant_query = {
+                "query": f"""query {{
+                    product(id: "{product_id}") {{
+                        variants(first: {variants_limit}, after: "{current_cursor}") {{
+                            edges {{
+                                node {{
+                                    id
+                                    title
+                                    sku
+                                    displayName
+                                    price
+                                    position
+                                    compareAtPrice
+                                    selectedOptions {{
+                                        name
+                                        value
+                                    }}
+                                    createdAt
+                                    updatedAt
+                                    taxable
+                                    barcode
+                                    inventoryQuantity
+                                    product {{
+                                        id
+                                    }}
+                                    image {{
+                                        id
+                                        altText
+                                        url
+                                        width
+                                        height
+                                    }}
+                                }}
+                            }}
+                            pageInfo {{
+                                hasNextPage
+                                endCursor
+                            }}
+                        }}
+                    }}
+                }}"""
+            }
+            
+            response = requests.post(graphql_url, headers=headers, json=variant_query, timeout=60)
+            
+            if response.status_code != 200:
+                logging.error(f"Failed to fetch additional variants for product {product_id}: {response.status_code}")
+                break
+                
+            data = response.json()
+            
+            if 'errors' in data:
+                logging.error(f"GraphQL errors fetching variants for product {product_id}: {data['errors']}")
+                break
+                
+            product_data = data.get('data', {}).get('product', {})
+            variants_data = product_data.get('variants', {})
+            variant_edges = variants_data.get('edges', [])
+            page_info = variants_data.get('pageInfo', {})
+            
+            # Add these variants to our collection
+            all_additional_variants.extend(variant_edges)
+            
+            # Check if there are more variant pages
+            has_next_page = page_info.get('hasNextPage', False)
+            current_cursor = page_info.get('endCursor')
+            
+            logging.info(f"Fetched {len(variant_edges)} additional variants for product {product_id} (page {variant_page_count})")
+            
+            if not has_next_page:
+                break
+                
+        logging.info(f"Completed fetching additional variants for product {product_id}. Total additional variants: {len(all_additional_variants)}")
+        return all_additional_variants
+        
+    except Exception as e:
+        logging.error(f"Error fetching additional variants for product {product_id}: {str(e)}")
+        return []
 
 
 @app.route(route="get_order_data")

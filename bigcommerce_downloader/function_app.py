@@ -22,7 +22,7 @@ def get_product_data(req: func.HttpRequest) -> func.HttpResponse:
         base_url = req.params.get('base_url')  # e.g., api.bigcommerce.com/stores/lb2chb77ok
         api_version = req.params.get('api_version', 'v3')  # Default to v3
         item = req.params.get('item', 'products')  # Default to products
-        page_size = req.params.get('page_size', '250')
+        page_size = req.params.get('page_size', '100')  # Reduced for better rate limiting
         auth_token = req.params.get('auth_token')  # BigCommerce API token
         datalake_key = req.params.get('datalake_key')
         data_lake_path = req.params.get('data_lake_path', 'RetailProducts/input/files/json/products/base')
@@ -247,7 +247,11 @@ def fetch_bigcommerce_catalog_data(auth_token: str, base_url: str, api_version: 
                 "item_type": item,
                 "date_range": "all",
                 "fetch_timestamp": datetime.now().isoformat(),
-                "pages_fetched": "multiple" if len(all_items) > 0 else 0
+                "pages_fetched": "multiple" if len(all_items) > 0 else 0,
+                "variant_pagination_enabled": item == 'variants',
+                "separate_endpoints": True,
+                "enhanced_limits": True,
+                "page_size_limit": 100
             }
         }
 
@@ -360,53 +364,99 @@ def fetch_product_specific_data(headers: dict, base_url: str, api_version: str, 
         elif item == 'images':
             endpoint_url = f"{base_url}/{api_version}/catalog/products/{product_id}/images"
         
-        # Fetch data for this product with retry logic for network issues
-        max_retries = 3
+        # Fetch data for this product with pagination and retry logic
+        product_items = fetch_paginated_product_data(endpoint_url, headers, product_id, item, page_size)
+        
+        if product_items:
+            all_items.extend(product_items)
+            logging.info(f"Found {len(product_items)} {item} for product {product_id}")
+        else:
+            logging.warning(f"No {item} found for product {product_id}")
+    
+    logging.info(f"Completed fetching {item}. Total items: {len(all_items)}")
+    return all_items
+
+
+def fetch_paginated_product_data(endpoint_url: str, headers: dict, product_id: str, item_type: str, page_size: str) -> list:
+    """
+    Fetch paginated data for a specific product (variants, options, images) with retry logic
+    """
+    all_items = []
+    page = 1
+    max_pages = 20  # Safety limit for product-specific pagination
+    max_retries = 3
+    
+    # Add explicit limit parameter to ensure we get the requested page size
+    limit = min(100, int(page_size))  # Cap at 100 for rate limiting
+    
+    while page <= max_pages:
         retry_count = 0
         success = False
         
+        # Add pagination parameters
+        paginated_url = f"{endpoint_url}?limit={limit}&page={page}"
+        
         while retry_count < max_retries and not success:
             try:
-                response = requests.get(endpoint_url, headers=headers, timeout=30)
+                logging.info(f"Fetching {item_type} for product {product_id}, page {page} (limit: {limit})")
+                response = requests.get(paginated_url, headers=headers, timeout=30)
                 
                 if response.status_code == 200:
                     try:
                         data = response.json()
                         items = data.get('data', [])
                         
+                        if not items:
+                            logging.info(f"No more {item_type} found for product {product_id} on page {page}")
+                            return all_items  # No more items, stop pagination
+                        
                         # Add product_id to each item for reference
                         for item_data in items:
                             item_data['product_id'] = product_id
                         
                         all_items.extend(items)
-                        logging.info(f"Found {len(items)} {item} for product {product_id}")
+                        logging.info(f"Page {page}: Found {len(items)} {item_type} for product {product_id}, total so far: {len(all_items)}")
+                        
+                        # Check if we got fewer items than requested (indicates last page)
+                        if len(items) < limit:
+                            logging.info(f"Got {len(items)} items (less than limit {limit}), assuming last page")
+                            return all_items
+                        
                         success = True
+                        page += 1
+                        break
                         
                     except json.JSONDecodeError as e:
-                        logging.error(f"Failed to parse JSON for product {product_id}: {e}")
-                        break  # Don't retry JSON errors
+                        logging.error(f"Failed to parse JSON for {item_type} product {product_id} page {page}: {e}")
+                        return all_items  # Don't retry JSON errors
+                        
+                elif response.status_code == 404:
+                    logging.info(f"404 for {item_type} product {product_id} page {page} - no more pages or no data")
+                    return all_items  # Don't retry 404s
+                    
                 else:
-                    logging.warning(f"Failed to fetch {item} for product {product_id}: {response.status_code}")
-                    if response.status_code == 404:
-                        break  # Don't retry 404s
+                    logging.warning(f"Failed to fetch {item_type} for product {product_id} page {page}: {response.status_code}")
                     retry_count += 1
                     if retry_count < max_retries:
-                        logging.info(f"Retrying {item} for product {product_id} (attempt {retry_count + 1})")
+                        logging.info(f"Retrying {item_type} for product {product_id} page {page} (attempt {retry_count + 1})")
+                        import time
+                        time.sleep(2)  # Wait 2 seconds before retry
+                    else:
+                        logging.error(f"Max retries exceeded for {item_type} product {product_id} page {page}")
+                        return all_items  # Return what we have so far
                         
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
                 retry_count += 1
-                logging.warning(f"Network error fetching {item} for product {product_id} (attempt {retry_count}): {str(e)}")
+                logging.warning(f"Network error fetching {item_type} for product {product_id} page {page} (attempt {retry_count}): {str(e)}")
                 if retry_count < max_retries:
-                    logging.info(f"Retrying {item} for product {product_id} (attempt {retry_count + 1})")
+                    logging.info(f"Retrying {item_type} for product {product_id} page {page} (attempt {retry_count + 1})")
                     import time
                     time.sleep(2)  # Wait 2 seconds before retry
                 else:
-                    logging.error(f"Max retries exceeded for {item} for product {product_id}")
-        
-        if not success and retry_count >= max_retries:
-            logging.warning(f"Skipping {item} for product {product_id} after {max_retries} failed attempts")
+                    logging.error(f"Max retries exceeded for {item_type} product {product_id} page {page} due to network errors")
+                    return all_items  # Return what we have so far
     
-    logging.info(f"Completed fetching {item}. Total items: {len(all_items)}")
+    logging.info(f"Reached max pages ({max_pages}) for {item_type} product {product_id}")
     return all_items
 
 
